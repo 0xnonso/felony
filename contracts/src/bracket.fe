@@ -1,0 +1,67 @@
+use core::num::leading_zeros
+use std::evm::keccak_words
+use ingot::constants::MAX_BRACKET_CAPACITY
+
+pub const THIRD_PLACE: u256 = 0
+pub const FINAL: u256 = 1
+pub const LEFT_SEMIFINAL: u256 = 2
+pub const RIGHT_SEMIFINAL: u256 = 3
+
+const SHUFFLE_DOMAIN: u256 = 505
+const TIE_DOMAIN: u256 = 504
+
+pub fn valid_capacity(_ capacity: u256) -> bool {
+    capacity >= 4 && capacity <= MAX_BRACKET_CAPACITY && (capacity & (capacity - 1)) == 0
+}
+
+pub fn bracket_size(_ count: u256) -> u256 {
+    assert!(count >= 4 && count <= MAX_BRACKET_CAPACITY)
+    1 << (256 - leading_zeros(count - 1))
+}
+
+pub fn shuffle_choice(_ seed: u256, _ size: u256) -> u256 {
+    assert!(size > 1 && size <= MAX_BRACKET_CAPACITY)
+    keccak_words([SHUFFLE_DOMAIN, seed, size]) % size
+}
+
+pub fn leaf_order(_ count: u256, _ capacity: u256, _ position: u256) -> u256 {
+    if count == capacity {
+        position
+    } else if position % 2 == 0 {
+        position / 2
+    } else {
+        capacity / 2 + position / 2
+    }
+}
+
+pub fn tie_seat(_ match_seed: u256) -> u256 {
+    keccak_words([TIE_DOMAIN, match_seed]) % 2
+}
+
+pub fn rounds(_ capacity: u256) -> u256 {
+    if capacity == 0 {
+        0
+    } else {
+        255 - leading_zeros(capacity)
+    }
+}
+
+pub fn draws(_ capacity: u256) -> u256 {
+    let r = rounds(capacity)
+    if r > 3 { r - 2 } else { 1 }
+}
+
+pub fn round_of(_ capacity: u256, _ index: u256) -> u256 {
+    if index == THIRD_PLACE {
+        return rounds(capacity)
+    }
+    rounds(capacity) - (255 - leading_zeros(index))
+}
+
+pub fn round_size(_ capacity: u256, _ round: u256) -> u256 {
+    if round == rounds(capacity) {
+        2
+    } else {
+        capacity >> round
+    }
+}

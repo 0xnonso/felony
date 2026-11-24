@@ -1,0 +1,13 @@
+{
+  "barretenberg_fe": {
+    "url": "https://github.com/0xnonso/barretenberg_fe.git",
+    "revision": "1241aa00f20bc207f2e9e41bfc51f8ae236ddaeb"
+  },
+  "versions": {
+    "fe": "26.6.0",
+    "barretenberg": "6.0.0",
+    "nargo": "1.0.0",
+    "solc": "0.8.30",
+    "forge": "1.4.4"
+  }
+}

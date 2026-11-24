@@ -1,0 +1,103 @@
+use ingot::types::BracketMatch
+
+use ingot::bracket::{
+    THIRD_PLACE,
+    bracket_size,
+    draws,
+    leaf_order,
+    round_of,
+    round_size,
+    rounds,
+    tie_seat,
+    valid_capacity,
+}
+
+#[test]
+fn only_supported_capacities_are_valid() {
+    assert!(
+        valid_capacity(4) && valid_capacity(8) && valid_capacity(16),
+    )
+    assert!(
+        !valid_capacity(0) && !valid_capacity(2) && !valid_capacity(6) && !valid_capacity(2048),
+    )
+}
+
+#[test]
+fn tie_coin_matches_the_python_reference() {
+    assert!(tie_seat(0) == 1 && tie_seat(1) == 1 && tie_seat(2) == 1)
+    assert!(tie_seat(3) == 0 && tie_seat(99) == 0)
+}
+
+#[test]
+fn views_have_stable_codes() {
+    let pending = BracketMatch::Pending.view()
+    assert!(pending[0] == 0 && pending[3] == 0)
+    let active = BracketMatch::InArena { match_id: 9 }.view()
+    assert!(active[0] == 1 && active[3] == 9)
+    let done = BracketMatch::Resolved { winner: 5, loser: 6 }.view()
+    assert!(done[0] == 2 && done[1] == 5 && done[2] == 6)
+}
+
+#[test]
+fn underfilled_brackets_spread_byes_across_distinct_matches() {
+    let counts: [u256; 5] = [17, 31, 33, 1000, 1023]
+    for c in 0 .. 5 {
+        let count = counts[c]
+        let capacity = bracket_size(count)
+        var seen: [bool; 1024] = [false; 1024]
+        var live: u256 = 0
+        var position: u256 = 0
+        while position < capacity {
+            let a = leaf_order(count, capacity, position)
+            let b = leaf_order(count, capacity, position + 1)
+            assert!(a < count && !seen[a.downcast_unchecked()])
+            seen[a.downcast_unchecked()] = true
+            live += 1
+            if b < count {
+                assert!(!seen[b.downcast_unchecked()])
+                seen[b.downcast_unchecked()] = true
+                live += 1
+            }
+            position += 2
+        }
+        assert!(live == count)
+    }
+}
+
+#[test]
+fn rounds_draws_and_round_membership() {
+    assert!(
+        rounds(4) == 2 && rounds(8) == 3 && rounds(16) == 4 && rounds(1024) == 10,
+    )
+
+    assert!(
+        draws(4) == 1 && draws(8) == 1 && draws(16) == 2 && draws(1024) == 8,
+    )
+    assert!(
+        round_of(16, 8) == 1 && round_of(16, 15) == 1 && round_of(16, 4) == 2,
+    )
+    assert!(
+        round_of(16, 2) == 3 && round_of(16, 1) == 4 && round_of(16, THIRD_PLACE) == 4,
+    )
+    assert!(
+        round_size(16, 1) == 8 && round_size(16, 3) == 2 && round_size(16, 4) == 2,
+    )
+}
+
+#[test]
+fn bit_scans_match_bracket_boundaries() {
+    assert!(rounds(0) == 0 && rounds(1) == 0)
+    for n in 4 .. 1025 {
+        let count = n as u256
+        let size = bracket_size(count)
+        assert!(size >= count && size / 2 < count && valid_capacity(size))
+        assert!((1 << rounds(size)) == size)
+        for i in 1 .. 11 {
+            let level = (i - 1) as u256
+            if level < rounds(size) {
+                assert!(round_of(size, 1 << level) == rounds(size) - level)
+                assert!(round_of(size, (2 << level) - 1) == rounds(size) - level)
+            }
+        }
+    }
+}

@@ -1,0 +1,45 @@
+[project]
+name = "felony"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "msgpack==1.1.2",
+    "numpy==2.3.5",
+    "pycryptodome==4.5.0",
+    "torch==2.9.1",
+]
+
+[dependency-groups]
+dev = ["pyright==1.1.414", "ruff==0.14.5"]
+docs = [
+    "zensical==0.1.2",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [
+    "lib",
+    "model/runs",
+    "model/artifacts",
+    "contracts/generated",
+    "target",
+    "out",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.pyright]
+include = ["model/felony", "model/tests", "scripts", "tests/reference"]
+exclude = ["**/__pycache__", "model/runs", "**/target"]
+extraPaths = ["model"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"
+typeCheckingMode = "basic"

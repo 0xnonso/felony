@@ -1,0 +1,29 @@
+{
+  "felony-untrained.json": {
+    "trained": false,
+    "sha256": "1bfb65312e0d0a36a29446423f635fe885cca5260adebbfa0f3091287d5280a8",
+    "command": "PYTHONPATH=model python -m felony init model/base/felony-untrained.json --seed 0"
+  },
+  "felony-base.json": {
+    "trained": true,
+    "sha256": "6a1349af5c9e8cd61f4a122d78be721915d688d6cbec70c35adfd6e31748b849",
+    "command": "PYTHONPATH=model python -m felony train model/runs/base --base model/base/felony-untrained.json --updates 2048 --seed 1",
+    "updates": 2048,
+    "games": 262144,
+    "training_seconds_single_thread": 64,
+    "development_score_vs_heuristics": {
+      "uniform": 0.778,
+      "match": 0.82,
+      "shift": 0.873,
+      "sandbag": 0.697,
+      "mixed": 0.73,
+      "cyclic": 0.763
+    }
+  },
+  "versions": {
+    "python": "3.12.8",
+    "numpy": "2.3.5",
+    "torch": "2.9.1"
+  },
+  "notes": "Neither file contains a sampling key or salt. Scores use 1000 seat-swapped development games per opponent. Five heuristics are training opponents; cyclic is an extra public development opponent. These are sanity checks, not a strength rating. Training reproduced byte for byte twice in the recorded local CPU environment."
+}

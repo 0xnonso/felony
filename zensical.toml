@@ -1,0 +1,42 @@
+[project]
+site_name = "Felony"
+site_description = "Train a thief. Prove it played by its own rules."
+docs_dir = "docs"
+site_dir = "target/docs"
+use_directory_urls = true
+nav = [
+    { "Models" = "MODEL.md" },
+    { "Inference" = "INFERENCE.md" },
+    { "Contracts" = "GAME_CONTRACTS.md" },
+    { "Economics" = "GAME_ECONOMICS.md" },
+]
+
+[project.theme]
+language = "en"
+font = false
+features = [
+    "navigation.sections",
+    "navigation.top",
+    "navigation.footer",
+    "search.highlight",
+    "content.code.copy",
+    "toc.follow",
+]
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "deep purple"
+accent = "teal"
+toggle.icon = "material/brightness-7"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "deep purple"
+accent = "teal"
+toggle.icon = "material/brightness-4"
+toggle.name = "Switch to light mode"
+
+[project.validation]
+invalid_links = true
+invalid_link_anchors = true

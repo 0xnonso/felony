@@ -1,0 +1,51 @@
+use std::abi::sol
+use std::evm::{Address, Call, Ctx, wei}
+use std::evm::erc20::safe_transfer
+use ingot::interfaces::{Arena, TournamentMsg}
+
+pub msg FeeCollectorCalls {
+    #[selector = sol("collectArena(address)")]
+    CollectArena { arena: Address },
+    #[selector = sol("collectTournament(address,uint256)")]
+    CollectTournament { tournament: Address, id: u256 },
+    #[selector = sol("withdrawETH(address,uint256)")]
+    WithdrawETH { to: Address, amount: u256 },
+    #[selector = sol("withdrawToken(address,address,uint256)")]
+    WithdrawToken { token: Address, to: Address, amount: u256 },
+    #[selector = sol("owner()")]
+    Owner -> Address,
+}
+
+pub contract FeeCollector {
+    owner: Address,
+    init(owner_: Address)
+    uses (mut owner)
+    {
+        assert!(owner_ != Address::zero())
+        owner = owner_
+    }
+    recv FeeCollectorCalls {
+        CollectArena { arena } uses (ctx: Ctx, call: mut Call) {
+            arena.call(Arena::Withdraw { to: ctx.address() })
+        }
+        CollectTournament { tournament, id } uses (call: mut Call) {
+            tournament.call(TournamentMsg::ClaimFees { id })
+        }
+        WithdrawETH { to, amount } uses (owner, ctx: Ctx, call: mut Call) {
+            assert!(ctx.caller() == owner && to != Address::zero())
+            let sent = call.send_value(addr: to, gas: ctx.gas(), value: wei(amount))
+            assert!(sent.success())
+        }
+        WithdrawToken { token, to, amount } uses (owner, ctx: Ctx, call: mut Call) {
+            assert!(ctx.caller() == owner && to != Address::zero())
+            safe_transfer(token: token, receiver: to, amount)
+        }
+        Owner -> Address uses (owner) {
+            owner
+        }
+    }
+    recv {
+        #[payable]
+        _ {}
+    }
+}

@@ -1,0 +1,114 @@
+use core::ptr::MemArray
+use std::evm::keccak_words
+use std::evm::merkle::verify_indexed
+use ingot::bracket::{leaf_order, rounds, shuffle_choice, valid_capacity}
+
+pub fn bracket_context(
+    _ chain: u256,
+    _ controller: u256,
+    _ id: u256,
+    _ seed: u256,
+    _ count: u256,
+    _ capacity: u256,
+) -> u256 {
+    keccak_words([515, chain, controller, id, seed, count, capacity])
+}
+
+pub fn leaf_hash(_ context: u256, _ position: u256, _ slot: u256) -> u256 {
+    keccak_words([513, context, position, slot])
+}
+
+pub fn node_hash(_ left: u256, _ right: u256) -> u256 {
+    keccak_words([left, right])
+}
+
+fn order_get(_ order: [u256; 45], _ index: u256) -> u256 {
+    (order[(index / 23).downcast_unchecked()] >> ((index % 23) * 11)) & 2047
+}
+
+fn order_set(_ order: mut [u256; 45], _ index: u256, _ slot: u256) {
+    let word: usize = (index / 23).downcast_unchecked()
+    let shift = (index % 23) * 11
+    order[word] = (order[word] & ~(2047 << shift)) | (slot << shift)
+}
+
+pub fn build_root(_ seed: u256, _ count: u256, _ capacity: u256, _ context: u256) -> u256 {
+    assert!(
+        valid_capacity(capacity) && count >= 4 && count <= capacity,
+    )
+    var order: [u256; 45] = [0; 45]
+    var i: u256 = 0
+    while i < count {
+        order_set(mut order, i, i + 1)
+        i += 1
+    }
+    var size = count
+    while size > 1 {
+        let choice = shuffle_choice(seed, size)
+        let held = order_get(order, size - 1)
+        let chosen = order_get(order, choice)
+        order_set(mut order, size - 1, chosen)
+        order_set(mut order, choice, held)
+        size -= 1
+    }
+
+    var frontier: [u256; 11] = [0; 11]
+    var root: u256 = 0
+    i = 0
+    while i < capacity {
+        let position = leaf_order(count, capacity, i)
+        let slot = if position < count {
+            order_get(order, position)
+        } else {
+            0
+        }
+        var hash = leaf_hash(context, i, slot)
+        var branch = i
+        var level: usize = 0
+        while branch & 1 == 1 {
+            hash = node_hash(frontier[level], hash)
+            branch >>= 1
+            level += 1
+        }
+        frontier[level] = hash
+        root = hash
+        i += 1
+    }
+    root
+}
+
+pub fn verify_pair(
+    _ root: u256,
+    _ context: u256,
+    _ capacity: u256,
+    _ index: u256,
+    _ slot0: u256,
+    _ slot1: u256,
+    _ siblings: [u256; 9],
+) -> bool {
+    if !valid_capacity(capacity) || index < capacity / 2 || index >= capacity {
+        return false
+    }
+    let position = 2 * (index - capacity / 2)
+    let hash = node_hash(
+        leaf_hash(context, position, slot0),
+        leaf_hash(context, position + 1, slot1),
+    )
+    let depth: usize = (rounds(capacity) - 1).downcast_unchecked()
+    for level in depth .. 9 {
+        if siblings[level] != 0 {
+            return false
+        }
+    }
+
+    var proof = MemArray<u256>::new_zeroed(depth)
+    for level in 0 .. depth {
+        proof.set(level, siblings[level])
+    }
+    verify_indexed(
+        proof: proof.as_slice(),
+        root,
+        leaf: hash,
+        index: index - capacity / 2,
+    )
+}

@@ -1,0 +1,628 @@
+use core::num::Bounded
+use core::ptr::MemArray
+use std::abi::{Bytes32, DynArray}
+use std::evm::{Address, Call, Ctx, Log, wei}
+use std::evm::crypto::keccak_words
+use std::evm::units::{days, hours, minutes, weeks}
+use ingot::constants::{BN254_SCALAR_MODULUS, MAX_BRACKET_CAPACITY}
+use ingot::rules::{initial, packed, resolve, forced, outcome, tournament_outcome}
+use ingot::types::{Game, ArenaStore, MatchPhase, MatchResult, MatchReservation}
+use ingot::events::{GameChanged, MoveAccepted, Withdrawal}
+use ingot::interfaces::{Arena, InferenceVerifier, IRandomOracle}
+
+#[inline(never)]
+fn load_game(_ id: u256) -> Game uses (store: ArenaStore) {
+    store.games.get(key: id)
+}
+#[inline(never)]
+fn save_game(_ id: u256, _ game: Game) uses (store: mut ArenaStore) {
+    store.games.set(key: id, value: game)
+}
+
+fn assert_unlocked() uses (store: ArenaStore) {
+    assert!(!store.guard.is_locked())
+}
+fn reservation_key(_ manager: Address, _ tournament: u256) -> u256 {
+    keccak_words([manager.word(), tournament])
+}
+fn reserved_match_id(_ manager: Address, _ tournament: u256, _ index: u256) -> u256
+uses (store: ArenaStore)
+{
+    let reservation = store.reservations.get(key: reservation_key(manager, tournament))
+    assert!(reservation.first != 0 && index < reservation.count)
+    reservation.first + index
+}
+fn request_randomness(_ id: u256, _ g: Game, _ oracle: Address, _ fee: u256) -> u256
+uses (ctx: Ctx, call: mut Call)
+{
+    call.call(
+        addr: oracle,
+        gas: ctx.gas(),
+        value: wei(fee),
+        message: IRandomOracle::RequestRandomness {
+            context: Bytes32 {
+                val: keccak_words(
+                    [520, ctx.chainid(), ctx.address().word(), id, g.commitment0, g.commitment1],
+                ),
+            },
+        },
+    )
+}
+fn valid_commitment(_ commitment: u256) {
+    assert!(commitment > 0 && commitment < BN254_SCALAR_MODULUS)
+}
+fn credit(_ player: Address, _ amount: u256) uses (store: mut ArenaStore) {
+    store.credits.set(
+            key: player,
+            value: store.credits.get(key: player) + amount,
+        )
+}
+fn notify(_ id: u256, _ g: Game) uses (log: mut Log) {
+    log.emit(
+        GameChanged {
+            id,
+            phase: g.phase.code(),
+            round: g.board.round,
+            submitted: g.submitted,
+            result: g.result.code(),
+        },
+    )
+}
+fn input_words(_ id: u256, _ g: Game, _ player: u256, _ action: u256) -> [u256; 9]
+uses (ctx: Ctx)
+{
+    let commitment = if player == 0 {
+        g.commitment0
+    } else {
+        g.commitment1
+    }
+    [
+        commitment,
+        packed(g.board, player),
+        ctx.chainid(),
+        ctx.address().word(),
+        id,
+        player,
+        g.board.round,
+        g.seed,
+        action,
+    ]
+}
+
+fn finish(_ id: u256, _ g: mut Game, _ result: MatchResult)
+uses (store: mut ArenaStore, fee_collector: Address, log: mut Log)
+{
+    g.phase = MatchPhase::Finished
+    g.result = result
+    if g.tournament != 0 {
+        save_game(id, g)
+        notify(id, g)
+        return
+    }
+
+    match result {
+        MatchResult::Player0Win | MatchResult::Player1Defaulted => {
+            let fee = g.stake / 20
+            credit(g.player0, 2 * g.stake - fee)
+            credit(fee_collector, fee)
+        },
+        MatchResult::Player1Win | MatchResult::Player0Defaulted => {
+            let fee = g.stake / 20
+            credit(g.player1, 2 * g.stake - fee)
+            credit(fee_collector, fee)
+        },
+        MatchResult::Draw => {
+            credit(g.player0, g.stake)
+            credit(g.player1, g.stake)
+        },
+        MatchResult::DoubleDefault => {
+            store.liabilities -= 2 * g.stake
+            store.burned += 2 * g.stake
+        },
+        MatchResult::Pending => assert!(false),
+    }
+    store.busy.set(key: g.player0, value: 0)
+    store.busy.set(key: g.player1, value: 0)
+    save_game(id, g)
+    notify(id, g)
+}
+
+pub contract Felony {
+    verifier: Address,
+    turn_seconds: u256,
+    oracle: Address,
+    fee_collector: Address,
+    mut store: ArenaStore,
+
+    init(verifier_: Address, oracle_: Address, fee_collector_: Address, turn_seconds_: u256)
+    uses (mut verifier, mut oracle, mut fee_collector, mut turn_seconds, ctx: Ctx)
+    {
+        assert!(
+            ctx.extcodesize(verifier_) > 0 && ctx.extcodesize(oracle_) > 0,
+        )
+        assert!(fee_collector_ != Address::zero())
+        assert!(
+            turn_seconds_ >= minutes(1).as_seconds() && turn_seconds_ <= days(1).as_seconds(),
+        )
+
+        verifier = verifier_
+        oracle = oracle_
+        fee_collector = fee_collector_
+        turn_seconds = turn_seconds_
+    }
+
+    recv Arena {
+        #[payable]
+        CreateChallenge { opponent, commitment, stake, join_seconds } -> u256
+        uses (mut store, turn_seconds, ctx: Ctx, log: mut Log)
+        {
+            assert_unlocked()
+            valid_commitment(commitment)
+            // Settlement must be able to represent both stakes.
+            assert!(stake <= u256::max() / 2)
+            assert!(opponent != Address::zero() && opponent != ctx.caller())
+            assert!(
+                join_seconds >= minutes(1).as_seconds() && join_seconds <= weeks(1).as_seconds(),
+            )
+            assert!(ctx.value().as_wei() == stake, "Wrong payment")
+            assert!(store.busy.get(key: ctx.caller()) == 0, "Player busy")
+            store.next_game += 1
+            let id = store.next_game
+            let g = Game {
+                player0: ctx.caller(),
+                player1: opponent,
+                commitment0: commitment,
+                commitment1: 0,
+                stake,
+                turn_seconds,
+                phase: MatchPhase::Invited,
+                deadline: ctx.timestamp().as_seconds() + join_seconds,
+                seed: 0,
+                board: initial(0),
+                submitted: 0,
+                bid0: 0,
+                bid1: 0,
+                result: MatchResult::Pending,
+                tournament: 0,
+                manager: Address::zero(),
+                request_id: 0,
+            }
+            store.liabilities += stake
+            store.busy.set(key: ctx.caller(), value: 1)
+            save_game(id, g)
+            notify(id, g)
+            id
+        }
+        #[payable]
+        JoinChallenge { id, commitment } uses (
+            mut store,
+            oracle,
+            ctx: Ctx,
+            call: mut Call,
+            log: mut Log,
+        ) {
+            assert_unlocked()
+            valid_commitment(commitment)
+            var g = load_game(id)
+            assert!(g.phase.is_invited() && ctx.caller() == g.player1)
+            assert!(
+                ctx.timestamp().as_seconds() <= g.deadline,
+                "Invitation expired",
+            )
+            assert!(store.busy.get(key: ctx.caller()) == 0, "Player busy")
+            let fee: u256 = call
+                .static(
+                    addr: oracle,
+                    gas: 200000,
+                    message: IRandomOracle::QuoteFee {},
+                )
+            assert!(ctx.value().as_wei() == g.stake + fee, "Wrong payment")
+            g.commitment1 = commitment
+            g.phase = MatchPhase::AwaitingRandomness
+
+            g.deadline = 0
+            store.liabilities += g.stake
+            store.busy.set(key: ctx.caller(), value: 1)
+            save_game(id, g)
+            store.guard.lock()
+            g.request_id = request_randomness(id, g, oracle, fee)
+            store.guard.unlock()
+            save_game(id, g)
+            notify(id, g)
+        }
+        CancelChallenge { id } uses (mut store, ctx: Ctx, log: mut Log) {
+            assert_unlocked()
+            var g = load_game(id)
+            assert!(g.phase.is_invited())
+            assert!(
+                ctx.caller() == g.player0 || ctx.timestamp().as_seconds() > g.deadline,
+            )
+            g.phase = MatchPhase::Cancelled
+            credit(g.player0, g.stake)
+            store.busy.set(key: g.player0, value: 0)
+            let pool = keccak_words([510, g.stake])
+            if store.waiting.get(key: pool) == id {
+                store.waiting.set(key: pool, value: 0)
+            }
+            save_game(id, g)
+            notify(id, g)
+        }
+        #[payable]
+        JoinQueue { commitment, stake } -> u256 uses (
+            mut store,
+            turn_seconds,
+            oracle,
+            ctx: Ctx,
+            call: mut Call,
+            log: mut Log,
+        ) {
+            assert_unlocked()
+            valid_commitment(commitment)
+            // Settlement must be able to represent both stakes.
+            assert!(stake <= u256::max() / 2)
+            assert!(store.busy.get(key: ctx.caller()) == 0, "Player busy")
+            let pool = keccak_words([510, stake])
+            var id = store.waiting.get(key: pool)
+            var g = load_game(id)
+
+            if g.phase.is_invited() && ctx.timestamp().as_seconds() > g.deadline {
+                g.phase = MatchPhase::Cancelled
+                credit(g.player0, g.stake)
+                store.busy.set(key: g.player0, value: 0)
+                save_game(id, g)
+                notify(id, g)
+            }
+            if g.phase.is_invited() {
+                g.player1 = ctx.caller()
+                g.commitment1 = commitment
+
+                g.phase = MatchPhase::AwaitingRandomness
+                g.deadline = 0
+                store.waiting.set(key: pool, value: 0)
+            } else {
+                store.next_game += 1
+                id = store.next_game
+                g = Game {
+                    player0: ctx.caller(),
+                    player1: Address::zero(),
+                    commitment0: commitment,
+                    commitment1: 0,
+                    stake,
+                    turn_seconds,
+                    phase: MatchPhase::Invited,
+                    deadline: ctx.timestamp().as_seconds() + hours(1).as_seconds(),
+                    seed: 0,
+                    board: initial(0),
+                    submitted: 0,
+                    bid0: 0,
+                    bid1: 0,
+                    result: MatchResult::Pending,
+                    tournament: 0,
+                    manager: Address::zero(),
+                    request_id: 0,
+                }
+                store.waiting.set(key: pool, value: id)
+            }
+            var fee: u256 = 0
+            if g.phase.is_awaiting_randomness() {
+                fee = call.static(
+                        addr: oracle,
+                        gas: 200000,
+                        message: IRandomOracle::QuoteFee {},
+                    )
+            }
+            assert!(ctx.value().as_wei() == stake + fee, "Wrong payment")
+            store.liabilities += stake
+            store.busy.set(key: ctx.caller(), value: 1)
+            save_game(id, g)
+            if g.phase.is_awaiting_randomness() {
+                store.guard.lock()
+                g.request_id = request_randomness(id, g, oracle, fee)
+                store.guard.unlock()
+                save_game(id, g)
+            }
+            notify(id, g)
+            id
+        }
+        ActivateMatch { id } uses (mut store, oracle, ctx: Ctx, call: Call, log: mut Log) {
+            assert_unlocked()
+            var g = load_game(id)
+            assert!(g.phase.is_awaiting_randomness())
+            let word: u256 = call
+                .static(
+                    addr: oracle,
+                    gas: 200000,
+                    message: IRandomOracle::GetRandomness { request_id: g.request_id },
+                )
+            g.seed = keccak_words([521, ctx.chainid(), ctx.address().word(), id, word])
+                % BN254_SCALAR_MODULUS
+            g.phase = MatchPhase::Playing
+            g.board = initial(g.seed)
+            g.deadline = ctx.timestamp().as_seconds() + g.turn_seconds
+            save_game(id, g)
+            notify(id, g)
+        }
+        SubmitMove { id, action, proof } uses (
+            mut store,
+            verifier,
+            fee_collector,
+            ctx: Ctx,
+            call: Call,
+            log: mut Log,
+        ) {
+            assert_unlocked()
+            var g = load_game(id)
+            assert!(
+                g.phase.is_playing() && ctx.timestamp().as_seconds() <= g.deadline,
+                "Move window closed",
+            )
+            assert!(action < 9)
+            let player = if ctx.caller() == g.player0 {
+                0
+            } else {
+                assert!(ctx.caller() == g.player1)
+                1
+            }
+            let bit = 1 << player
+            assert!(g.submitted & bit == 0, "Move already submitted")
+            let words = input_words(id, g, player, action)
+            var elements = MemArray<Bytes32>::new_zeroed(9)
+            for i in 0 .. 9 {
+                elements[i] = Bytes32 { val: words[i] }
+            }
+            let valid: bool = call
+                .static(
+                    addr: verifier,
+                    gas: ctx.gas(),
+                    message: InferenceVerifier::Verify {
+                        proof,
+                        public_inputs: DynArray::from_slice(elements.as_slice()),
+                    },
+                )
+            assert!(valid, "Invalid proof")
+
+            let hand = if player == 0 {
+                g.board.hand0
+            } else {
+                g.board.hand1
+            }
+            assert!((hand & (1 << action)) != 0, "Card already used")
+            log.emit(
+                MoveAccepted { id, round: g.board.round, seat: player, action },
+            )
+            if player == 0 {
+                g.bid0 = action + 1
+            } else {
+                g.bid1 = action + 1
+            }
+            g.submitted |= bit
+            if g.submitted == 3 {
+                g.board = resolve(g.board, g.bid0, g.bid1, g.seed)
+                g.submitted = 0
+                g.bid0 = 0
+                g.bid1 = 0
+                if g.board.round == 8 {
+                    g.board = resolve(
+                        g.board,
+                        forced(g.board.hand0),
+                        forced(g.board.hand1),
+                        g.seed,
+                    )
+                    let result = MatchResult::from_board(
+                        if g.tournament == 0 {
+                            outcome(g.board)
+                        } else {
+                            tournament_outcome(g.board)
+                        },
+                    )
+                    finish(id, mut g, result)
+                } else {
+                    g.deadline = ctx.timestamp().as_seconds() + g.turn_seconds
+                    save_game(id, g)
+                    notify(id, g)
+                }
+            } else {
+                save_game(id, g)
+                notify(id, g)
+            }
+        }
+        Forfeit { id } uses (mut store, fee_collector, ctx: Ctx, log: mut Log) {
+            assert_unlocked()
+            var g = load_game(id)
+            assert!(
+                g.phase.is_awaiting_randomness()
+                    || (g.phase.is_playing() && ctx.timestamp().as_seconds() <= g.deadline),
+            )
+            let result = if ctx.caller() == g.player0 {
+                MatchResult::Player0Defaulted
+            } else {
+                assert!(ctx.caller() == g.player1)
+                MatchResult::Player1Defaulted
+            }
+            finish(id, mut g, result)
+        }
+        ClaimTimeout { id } uses (
+            mut store,
+            oracle,
+            fee_collector,
+            ctx: Ctx,
+            call: Call,
+            log: mut Log,
+        ) {
+            assert_unlocked()
+            var g = load_game(id)
+            if g.phase.is_awaiting_randomness() {
+                let status: u256 = call
+                    .static(
+                        addr: oracle,
+                        gas: 200000,
+                        message: IRandomOracle::Status { request_id: g.request_id },
+                    )
+                assert!(status == 3)
+                g.phase = MatchPhase::Cancelled
+                credit(g.player0, g.stake)
+                credit(g.player1, g.stake)
+                store.busy.set(key: g.player0, value: 0)
+                store.busy.set(key: g.player1, value: 0)
+                save_game(id, g)
+                notify(id, g)
+            } else {
+                assert!(
+                    g.phase.is_playing() && ctx.timestamp().as_seconds() > g.deadline,
+                )
+                let result = MatchResult::timeout(g.submitted)
+                finish(id, mut g, result)
+            }
+        }
+        Withdraw { to } uses (mut store, ctx: Ctx, call: mut Call, log: mut Log) {
+            assert_unlocked()
+            assert!(to != Address::zero())
+            let amount = store.credits.get(key: ctx.caller())
+            assert!(amount > 0, "No credit")
+            store.credits.set(key: ctx.caller(), value: 0)
+            store.liabilities -= amount
+            store.guard.lock()
+            let sent = call.send_value(addr: to, gas: ctx.gas(), value: wei(amount))
+            store.guard.unlock()
+            assert!(sent.success(), "ETH transfer failed")
+            log.emit(Withdrawal { player: ctx.caller(), to, amount })
+        }
+        ReserveManagedMatches { tournament, count } -> u256
+        uses (mut store, ctx: Ctx)
+        {
+            assert_unlocked()
+            assert!(
+                tournament != 0 && count > 0 && count <= MAX_BRACKET_CAPACITY,
+            )
+            let key = reservation_key(ctx.caller(), tournament)
+            assert!(store.reservations.get(key: key).first == 0)
+            let first = store.next_game + 1
+            store.next_game += count
+            store.reservations.set(key: key, value: MatchReservation { first, count })
+            first
+        }
+        ManagedMatchId { manager, tournament, index } -> u256
+        uses (store)
+        {
+            reserved_match_id(manager, tournament, index)
+        }
+        CreateManagedMatch {
+            player0,
+            player1,
+            commitment0,
+            commitment1,
+            tournament,
+            seed,
+            turn_seconds: match_seconds,
+            index,
+        } -> u256
+        uses (mut store, ctx: Ctx, log: mut Log)
+        {
+            assert_unlocked()
+            assert!(
+                player0 != Address::zero()
+                    && player1 != Address::zero()
+                    && player0 != player1
+                    && tournament != 0,
+            )
+            valid_commitment(commitment0)
+            valid_commitment(commitment1)
+            assert!(
+                match_seconds >= minutes(1).as_seconds() && match_seconds <= days(1).as_seconds(),
+            )
+            let id = reserved_match_id(ctx.caller(), tournament, index)
+            match load_game(id).phase {
+                MatchPhase::Uninitialized => {},
+                _ => assert!(false),
+            }
+            let fixed_seed = seed % BN254_SCALAR_MODULUS
+            let g = Game {
+                player0,
+                player1,
+                commitment0,
+                commitment1,
+                stake: 0,
+                turn_seconds: match_seconds,
+                phase: MatchPhase::Playing,
+                deadline: ctx.timestamp().as_seconds() + match_seconds,
+                seed: fixed_seed,
+                board: initial(fixed_seed),
+                submitted: 0,
+                bid0: 0,
+                bid1: 0,
+                result: MatchResult::Pending,
+                tournament,
+                manager: ctx.caller(),
+                request_id: 0,
+            }
+            save_game(id, g)
+            notify(id, g)
+            id
+        }
+        ManagedInfo { id } -> [u256; 4] uses (store) {
+            let g = load_game(id)
+            [g.manager.word(), if g.result.defaulted() { 1 } else { 0 }, 0, 0]
+        }
+        RandomnessRequest { id } -> u256 uses (store) {
+            let g = load_game(id)
+            assert!(
+                g.player1 != Address::zero() && g.tournament == 0 && !g.phase.is_invited(),
+            )
+            g.request_id
+        }
+        QueueHead { stake } -> u256 uses (store) {
+            store.waiting.get(key: keccak_words([510, stake]))
+        }
+        Settings -> [u256; 5] uses (verifier, turn_seconds, oracle, fee_collector, ctx: Ctx) {
+            [
+                verifier.word(),
+                ctx.extcodehash(verifier),
+                turn_seconds,
+                oracle.word(),
+                fee_collector.word(),
+            ]
+        }
+        CreditOf { player } -> u256 uses (store) {
+            store.credits.get(key: player)
+        }
+        Busy { player } -> u256 uses (store) {
+            store.busy.get(key: player)
+        }
+        Burned -> u256 uses (store) {
+            store.burned
+        }
+        Liabilities -> u256 uses (store) {
+            store.liabilities
+        }
+        MatchInfo { id } -> [u256; 18] uses (store) {
+            let g = load_game(id)
+            [
+                g.player0.word(),
+                g.player1.word(),
+                g.commitment0,
+                g.commitment1,
+                g.stake,
+                0,
+                g.phase.code(),
+                g.deadline,
+                0,
+                g.seed,
+                g.board.round,
+                g.submitted,
+                g.board.score0,
+                g.board.score1,
+                g.result.code(),
+                g.tournament,
+                g.bid0,
+                g.bid1,
+            ]
+        }
+        ProofInputs { id, player, action } -> [u256; 9]
+        uses (store, ctx: Ctx)
+        {
+            let g = load_game(id)
+            assert!(g.phase.is_playing() && player < 2 && action < 9)
+            input_words(id, g, player, action)
+        }
+    }
+}

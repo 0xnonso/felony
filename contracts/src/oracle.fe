@@ -1,0 +1,226 @@
+use std::abi::{Bytes32, bytes_from_words_prefix}
+use std::evm::{Address, Call, Ctx, Log, wei}
+use std::evm::crypto::keccak_words
+use ingot::interfaces::{IRandomOracle, OracleAdmin, RandomWordsRequest, VRFCoordinator}
+use ingot::types::{OracleRequest, OracleRequestState, OracleStore}
+use ingot::events::{ConsumerChanged, FeesWithdrawn, RandomnessReady, RandomnessRequested}
+
+fn state_code(_ request: OracleRequest) -> u256 uses (ctx: Ctx) {
+    match request.state {
+        OracleRequestState::Unknown => {
+            assert!(false)
+            0
+        },
+        OracleRequestState::Pending => if ctx.timestamp().as_seconds() > request.deadline {
+            3
+        } else {
+            1
+        },
+        OracleRequestState::Ready => 2,
+    }
+}
+
+pub contract ChainlinkRandomOracle {
+    coordinator: Address,
+    sponsor: Address,
+    key_hash: Bytes32,
+    subscription_id: u256,
+    confirmations: u16,
+    callback_gas_limit: u32,
+    timeout_seconds: u256,
+    native_payment: bool,
+    request_fee: u256,
+    mut store: OracleStore,
+
+    init(
+        coordinator_: Address,
+        sponsor_: Address,
+        key_hash_: Bytes32,
+        subscription_id_: u256,
+        confirmations_: u16,
+        callback_gas_limit_: u32,
+        timeout_seconds_: u256,
+        native_payment_: bool,
+        request_fee_: u256,
+    )
+    uses (
+        mut coordinator,
+        mut sponsor,
+        mut key_hash,
+        mut subscription_id,
+        mut confirmations,
+        mut callback_gas_limit,
+        mut timeout_seconds,
+        mut native_payment,
+        mut request_fee,
+        ctx: Ctx,
+    )
+    {
+        assert!(
+            ctx.extcodesize(coordinator_) > 0 && sponsor_ != Address::zero(),
+        )
+        assert!(key_hash_.word() != 0 && subscription_id_ != 0)
+        assert!(confirmations_ > 0 && confirmations_ <= 200)
+        assert!(callback_gas_limit_ >= 100000 && timeout_seconds_ > 0)
+        coordinator = coordinator_
+        sponsor = sponsor_
+        key_hash = key_hash_
+        subscription_id = subscription_id_
+        confirmations = confirmations_
+        callback_gas_limit = callback_gas_limit_
+        timeout_seconds = timeout_seconds_
+        native_payment = native_payment_
+        request_fee = request_fee_
+    }
+    recv IRandomOracle {
+        QuoteFee -> u256 uses (request_fee) {
+            request_fee
+        }
+        #[payable]
+        RequestRandomness { context } -> u256 uses (
+            coordinator,
+            key_hash,
+            subscription_id,
+            confirmations,
+            callback_gas_limit,
+            timeout_seconds,
+            native_payment,
+            request_fee,
+            mut store,
+            ctx: Ctx,
+            call: mut Call,
+            log: mut Log,
+        ) {
+            assert!(ctx.value().as_wei() == request_fee, "Wrong payment")
+            let consumer = ctx.caller()
+            assert!(
+                !store.guard.is_locked() && store.consumers.get(key: consumer),
+            )
+            let context_key = keccak_words([consumer.word(), context.word()])
+            assert!(
+                !store.contexts.get(key: context_key),
+                "Context already used",
+            )
+            store.contexts.set(key: context_key, value: true)
+            store.guard.lock()
+
+            let payment: u256 = if native_payment { 1 } else { 0 }
+            let extra_args = bytes_from_words_prefix<36, 2>([0x92fd1338 << 224, payment << 224])
+            let request_id = coordinator
+                .call(
+                    VRFCoordinator::RequestRandomWords {
+                        request: RandomWordsRequest {
+                            key_hash,
+                            sub_id: subscription_id,
+                            confirmations,
+                            callback_gas_limit,
+                            num_words: 1,
+                            extra_args,
+                        },
+                    },
+                )
+            assert!(request_id != 0)
+            match store.requests.get(key: request_id).state {
+                OracleRequestState::Unknown => {},
+                _ => assert!(false),
+            }
+            let deadline = ctx.timestamp().as_seconds() + timeout_seconds
+            store
+                .requests
+                .set(
+                    key: request_id,
+                    value: OracleRequest {
+                        state: OracleRequestState::Pending,
+                        consumer,
+                        deadline,
+                        word: 0,
+                    },
+                )
+            store.fees += request_fee
+            store.guard.unlock()
+            log.emit(
+                RandomnessRequested { request_id, consumer, context, deadline },
+            )
+            request_id
+        }
+        Status { request_id } -> u256 uses (store, ctx: Ctx) {
+            state_code(store.requests.get(key: request_id))
+        }
+        IsReady { request_id } -> bool uses (store) {
+            store.requests.get(key: request_id).state.is_ready()
+        }
+        GetRandomness { request_id } -> u256 uses (store) {
+            let request = store.requests.get(key: request_id)
+            assert!(request.state.is_ready(), "Randomness not ready")
+            request.word
+        }
+    }
+    recv OracleAdmin {
+        Fees -> u256 uses (store) {
+            store.fees
+        }
+        WithdrawFees { to } uses (sponsor, mut store, ctx: Ctx, call: mut Call, log: mut Log) {
+            assert!(
+                ctx.caller() == sponsor && !store.guard.is_locked() && to != Address::zero(),
+            )
+            let amount = store.fees
+            assert!(amount > 0)
+            store.fees = 0
+            store.guard.lock()
+            let sent = call.send_value(addr: to, gas: ctx.gas(), value: wei(amount))
+            assert!(sent.success())
+            store.guard.unlock()
+            log.emit(FeesWithdrawn { to, amount })
+        }
+        SetConsumer { consumer, allowed } uses (sponsor, mut store, ctx: Ctx, log: mut Log) {
+            assert!(ctx.caller() == sponsor && consumer != Address::zero())
+            store.consumers.set(key: consumer, value: allowed)
+            log.emit(ConsumerChanged { consumer, allowed })
+        }
+        IsConsumer { consumer } -> bool uses (store) {
+            store.consumers.get(key: consumer)
+        }
+        Fulfill { request_id, words } uses (coordinator, mut store, ctx: Ctx, log: mut Log) {
+            assert!(ctx.caller() == coordinator && !store.guard.is_locked())
+            var request = store.requests.get(key: request_id)
+            match request.state {
+                OracleRequestState::Pending => {},
+                _ => assert!(false),
+            }
+            assert!(
+                ctx.timestamp().as_seconds() <= request.deadline && words.len() == 1,
+            )
+            request.word = words.get(0)
+            request.state = OracleRequestState::Ready
+            store.requests.set(key: request_id, value: request)
+            log.emit(RandomnessReady { request_id, random_word: request.word })
+        }
+        RequestInfo { request_id } -> [u256; 3] uses (store, ctx: Ctx) {
+            let request = store.requests.get(key: request_id)
+            [request.consumer.word(), request.deadline, state_code(request)]
+        }
+        Settings -> [u256; 9] uses (
+            coordinator,
+            sponsor,
+            key_hash,
+            subscription_id,
+            confirmations,
+            callback_gas_limit,
+            timeout_seconds,
+            native_payment,
+            request_fee,
+        ) {
+            [
+                coordinator.word(),
+                sponsor.word(),
+                key_hash.word(),
+                subscription_id,
+                confirmations as u256,
+                callback_gas_limit as u256,
+                timeout_seconds,
+                if native_payment { 1 } else { 0 },
+                request_fee,
+            ]
+        }
+    }
+}

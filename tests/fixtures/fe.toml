@@ -1,0 +1,6 @@
+[ingot]
+name = "vault_fixture"
+version = "0.1.0"
+
+[dependencies]
+felony = { path = "../../contracts" }

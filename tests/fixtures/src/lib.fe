@@ -1,0 +1,123 @@
+use std::abi::sol
+use std::evm::{Address, Call, Ctx, wei}
+use std::evm::erc20::{safe_transfer, safe_transfer_from}
+use felony::interfaces::{WrappedNative, DepositVault}
+use felony::vault::{asset_of, token_balance, deposit_assets, transfer_shares}
+
+fn redeem_assets(_ vault: Address, _ asset: Address, _ shares: u256) -> u256
+uses (ctx: Ctx, call: mut Call)
+{
+    assert!(shares > 0 && asset_of(vault) == asset)
+    let owner = ctx.address()
+    let assets_before = token_balance(asset, owner)
+    let shares_before = token_balance(vault, owner)
+    let reported: u256 = vault.call(DepositVault::Redeem { shares, receiver: owner, owner })
+    let assets = token_balance(asset, owner) - assets_before
+    assert!(
+        shares_before - token_balance(vault, owner) == shares && reported == assets,
+    )
+    assets
+}
+
+pub msg HarnessMsg {
+    #[selector = sol("enter(uint256)")]
+    Enter { amount: u256 } -> u256,
+    #[selector = sol("enterNative()")]
+    EnterNative -> u256,
+    #[selector = sol("exit(uint256)")]
+    Exit { shares: u256 } -> u256,
+    #[selector = sol("exitNative(uint256)")]
+    ExitNative { shares: u256 } -> u256,
+    #[selector = sol("sendShares(address,uint256)")]
+    SendShares { to: Address, shares: u256 },
+}
+
+pub contract VaultHarness {
+    vault: Address,
+    asset: Address,
+    owner: Address,
+    mut locked: bool,
+
+    init(vault_: Address)
+    uses (mut vault, mut asset, mut owner, ctx: Ctx, call: Call)
+    {
+        vault = vault_
+        asset = asset_of(vault_)
+        owner = ctx.caller()
+        assert!(ctx.extcodesize(asset) > 0)
+    }
+
+    recv HarnessMsg {
+        Enter { amount } -> u256 uses (vault, asset, owner, mut locked, ctx: Ctx, call: mut Call) {
+            assert!(!locked && ctx.caller() == owner)
+            locked = true
+            let before = token_balance(asset, ctx.address())
+            safe_transfer_from(
+                token: asset,
+                owner: ctx.caller(),
+                receiver: ctx.address(),
+                amount,
+            )
+            assert!(token_balance(asset, ctx.address()) - before == amount)
+            let shares = deposit_assets(vault, asset, amount)
+            locked = false
+            shares
+        }
+        #[payable]
+        EnterNative {} -> u256 uses (vault, asset, owner, mut locked, ctx: Ctx, call: mut Call) {
+            assert!(!locked && ctx.caller() == owner)
+            locked = true
+            let amount = ctx.value().as_wei()
+            let before = token_balance(asset, ctx.address())
+            call.call(
+                addr: asset,
+                gas: ctx.gas(),
+                value: wei(amount),
+                message: WrappedNative::Deposit {},
+            )
+            assert!(token_balance(asset, ctx.address()) - before == amount)
+            let shares = deposit_assets(vault, asset, amount)
+            locked = false
+            shares
+        }
+        Exit { shares } -> u256 uses (vault, asset, owner, mut locked, ctx: Ctx, call: mut Call) {
+            assert!(!locked && ctx.caller() == owner)
+            locked = true
+            let amount = redeem_assets(vault, asset, shares)
+            safe_transfer(token: asset, receiver: ctx.caller(), amount)
+            locked = false
+            amount
+        }
+        ExitNative { shares } -> u256 uses (
+            vault,
+            asset,
+            owner,
+            mut locked,
+            ctx: Ctx,
+            call: mut Call,
+        ) {
+            assert!(!locked && ctx.caller() == owner)
+            locked = true
+            let amount = redeem_assets(vault, asset, shares)
+            let before = ctx.selfbalance().as_wei()
+            asset.call(WrappedNative::Withdraw { amount })
+            assert!(ctx.selfbalance().as_wei() - before == amount)
+            let sent = call.send_value(addr: ctx.caller(), gas: ctx.gas(), value: wei(amount))
+            assert!(sent.success())
+            locked = false
+            amount
+        }
+        SendShares { to, shares } uses (vault, owner, mut locked, ctx: Ctx, call: mut Call) {
+            assert!(!locked && ctx.caller() == owner)
+            locked = true
+            transfer_shares(vault, to, shares)
+            locked = false
+        }
+    }
+    recv {
+        #[payable]
+        _ uses (asset, locked, ctx: Ctx) {
+            assert!(locked && ctx.caller() == asset)
+        }
+    }
+}

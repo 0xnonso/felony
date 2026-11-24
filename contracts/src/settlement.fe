@@ -1,0 +1,74 @@
+use core::num::mul_div
+use core::ops::SaturatingSub
+
+pub const MAX_CONVERSION_VALUE: u256 = 1 << 128
+pub const PLACE_WEIGHTS: [u256; 3] = [50, 30, 20]
+pub const FEE_BPS: u256 = 500
+pub const UPDATE_DIVISOR: u256 = 10
+pub const LOSS_TAX_DIVISOR: u256 = 40
+
+pub struct Split {
+    pub fee: u256,
+    pub prizes: [u256; 3],
+    pub bonus: u256,
+    pub remainder: u256,
+    pub unowned: u256,
+}
+
+impl Copy for Split {}
+
+pub fn usable_quote(_ quote: u256, _ shares: u256) -> bool {
+    quote > 0 && quote < MAX_CONVERSION_VALUE && shares < MAX_CONVERSION_VALUE
+}
+
+pub fn base_value(principal: u256, deducted: u256, scale: u256, entrants: u256) -> u256 {
+    if principal == 0 || entrants == 0 {
+        return 0
+    }
+    let kept = principal.saturating_sub(deducted)
+    mul_div(scale, kept, entrants * principal)
+}
+
+pub fn to_shares(_ value: u256, _ shares: u256, _ total: u256) -> u256 {
+    if total == 0 {
+        0
+    } else if shares == total {
+        value
+    } else {
+        mul_div(value, shares, total)
+    }
+}
+
+pub fn split_pool(_ pool: u256, eligible: u256, places: [u256; 3]) -> Split {
+    if eligible == 0 {
+        return Split { fee: 0, prizes: [0; 3], bonus: 0, remainder: 0, unowned: pool }
+    }
+    let fee = mul_div(pool, FEE_BPS, 10000)
+    let rest = pool - fee
+    var total_weight: u256 = 0
+    for i in 0 .. 3 {
+        if places[i] != 0 {
+            total_weight += PLACE_WEIGHTS[i]
+        }
+    }
+    var prizes: [u256; 3] = [0; 3]
+    if total_weight == 0 {
+        return Split { fee, prizes, bonus: rest / eligible, remainder: rest % eligible, unowned: 0 }
+    }
+    var assigned: u256 = 0
+    for i in 0 .. 3 {
+        if places[i] != 0 {
+            prizes[i] = mul_div(rest, PLACE_WEIGHTS[i], total_weight)
+            assigned += prizes[i]
+        }
+    }
+
+    var paid = false
+    for i in 0 .. 3 {
+        if !paid && places[i] != 0 {
+            prizes[i] += rest - assigned
+            paid = true
+        }
+    }
+    Split { fee, prizes, bonus: 0, remainder: 0, unowned: 0 }
+}

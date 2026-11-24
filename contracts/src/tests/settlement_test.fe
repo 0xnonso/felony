@@ -1,0 +1,194 @@
+use ingot::settlement::{Split, base_value, split_pool, to_shares, usable_quote}
+
+const ALL: [u256; 3] = [1, 2, 3]
+const NONE: [u256; 3] = [0, 0, 0]
+
+fn total(_ s: Split, _ eligible: u256) -> u256 {
+    s.fee + s.prizes[0] + s.prizes[1] + s.prizes[2] + eligible * s.bonus + s.remainder + s.unowned
+}
+
+#[test]
+fn base_keeps_principal_minus_deductions_without_loss() {
+    assert!(
+        base_value(principal: 100, deducted: 0, scale: 400, entrants: 4) == 100,
+    )
+    assert!(
+        base_value(principal: 100, deducted: 12, scale: 400, entrants: 4) == 88,
+    )
+}
+
+#[test]
+fn loss_is_shared_before_deductions() {
+    assert!(
+        base_value(principal: 100, deducted: 0, scale: 200, entrants: 4) == 50,
+    )
+    assert!(
+        base_value(principal: 100, deducted: 20, scale: 200, entrants: 4) == 40,
+    )
+}
+
+#[test]
+fn deductions_never_go_negative_and_zero_principal_pays_nothing() {
+    assert!(
+        base_value(principal: 100, deducted: 100, scale: 400, entrants: 4) == 0,
+    )
+    assert!(
+        base_value(principal: 100, deducted: 150, scale: 400, entrants: 4) == 0,
+    )
+    assert!(
+        base_value(principal: 0, deducted: 0, scale: 0, entrants: 4) == 0,
+    )
+}
+
+#[test]
+fn places_split_after_the_fee() {
+    let s = split_pool(1000, eligible: 3, places: ALL)
+    assert!(
+        s.fee == 50 && s.prizes[0] == 475 && s.prizes[1] == 285 && s.prizes[2] == 190,
+    )
+    assert!(s.bonus == 0 && s.remainder == 0 && s.unowned == 0)
+    assert!(total(s, 3) == 1000)
+}
+
+#[test]
+fn missing_places_renormalize_and_rounding_goes_to_the_highest() {
+    let s = split_pool(101, eligible: 2, places: [7, 0, 9])
+    assert!(
+        s.fee == 5 && s.prizes[0] == 69 && s.prizes[1] == 0 && s.prizes[2] == 27,
+    )
+    assert!(total(s, 2) == 101)
+}
+
+#[test]
+fn no_place_pays_an_equal_bonus_and_remainder() {
+    let s = split_pool(103, eligible: 3, places: NONE)
+    assert!(s.fee == 5 && s.bonus == 32 && s.remainder == 2)
+    assert!(total(s, 3) == 103)
+}
+
+#[test]
+fn nobody_eligible_means_no_fee_and_everything_unowned() {
+    let s = split_pool(400, eligible: 0, places: NONE)
+    assert!(s.fee == 0 && s.unowned == 400 && total(s, 0) == 400)
+}
+
+#[test]
+fn conversion_and_quote_bounds() {
+    assert!(to_shares(50, 400, 440) == 45)
+    assert!(to_shares(5, 0, 0) == 0)
+    assert!(
+        usable_quote(1, 1) && !usable_quote(0, 1) && !usable_quote(1 << 128, 1),
+    )
+}
+
+const MAX_U256: u256 = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+
+#[test]
+fn maximum_roster_principal_preserves_base_and_deductions() {
+    let principal = MAX_U256 / 1024
+    let scale = principal * 1024
+    assert!(
+        base_value(
+                principal: principal,
+                deducted: 0,
+                scale: scale,
+                entrants: 1024,
+            ) == principal,
+    )
+    assert!(
+        base_value(
+                principal: principal,
+                deducted: principal / 10,
+                scale: scale,
+                entrants: 1024,
+            )
+            == principal - principal / 10,
+    )
+}
+
+#[test]
+fn max_share_fallback_preserves_exact_floor() {
+    assert!(
+        base_value(principal: 100, deducted: 0, scale: MAX_U256, entrants: 4)
+            == 28948022309329048855892746252171976963317496166410141009864396001978282409983,
+    )
+    assert!(
+        base_value(
+                principal: 1000000000000000000000000,
+                deducted: 700000000000000000000000,
+                scale: MAX_U256,
+                entrants: 1024,
+            )
+            == 33923463643744979127999312014264035503887690820011883995934839064818299699,
+    )
+    assert!(
+        base_value(principal: 100, deducted: 12, scale: MAX_U256, entrants: 4)
+            == 25474259632209562993185616701911339727719396626440924088680668481740888520785,
+    )
+}
+
+#[test]
+fn max_share_fallback_conversions_are_identity() {
+    assert!(to_shares(MAX_U256, MAX_U256, MAX_U256) == MAX_U256)
+    assert!(
+        to_shares(MAX_U256 / 3, MAX_U256, MAX_U256) == MAX_U256 / 3,
+    )
+    assert!(to_shares(0, MAX_U256, MAX_U256) == 0)
+    assert!(!usable_quote(1, MAX_U256))
+}
+
+#[test]
+fn max_pool_fee_and_prize_split_conserve_every_share() {
+    let s = split_pool(MAX_U256, eligible: 3, places: ALL)
+    assert!(
+        s.fee == 5789604461865809771178549250434395392663499233282028201972879200395656481996,
+    )
+    assert!(
+        s.prizes[1]
+            == 33000745432635115695717730727476053738181945629707560751245411442255241947381,
+    )
+    assert!(
+        s.prizes[2]
+            == 22000496955090077130478487151650702492121297086471707167496940961503494631587,
+    )
+    assert!(total(s, 3) == MAX_U256)
+    let bonus = split_pool(MAX_U256, eligible: 1024, places: NONE)
+    assert!(total(bonus, 1024) == MAX_U256)
+    let unowned = split_pool(MAX_U256, eligible: 0, places: NONE)
+    assert!(
+        unowned.unowned == MAX_U256 && total(unowned, 0) == MAX_U256,
+    )
+}
+
+#[test]
+fn largest_quoted_conversion_stays_exact() {
+    let bound: u256 = (1 << 128) - 1
+    assert!(usable_quote(bound, bound - 1))
+    assert!(to_shares(bound, bound - 1, bound) == bound - 1)
+    assert!(
+        to_shares(bound / 3, bound - 1, bound) == 113427455640312821154458202477256070484,
+    )
+    assert!(
+        base_value(
+                principal: 1000000000000000000000000,
+                deducted: 100000000000000000000000,
+                scale: 1024000000000000000000000000,
+                entrants: 1024,
+            )
+            == 900000000000000000000000,
+    )
+}
+
+#[test]
+fn large_fallback_with_deductions_and_forfeit_conserves_total() {
+    let a = base_value(principal: 100, deducted: 0, scale: MAX_U256, entrants: 4)
+    let b = base_value(principal: 100, deducted: 10, scale: MAX_U256, entrants: 4)
+    let c = base_value(principal: 100, deducted: 12, scale: MAX_U256, entrants: 4)
+    let s = split_pool(MAX_U256 - a - b - c, eligible: 3, places: ALL)
+    assert!(
+        a == 28948022309329048855892746252171976963317496166410141009864396001978282409983
+            && b == 26053220078396143970303471626954779266985746549769126908877956401780454168985
+            && c == 25474259632209562993185616701911339727719396626440924088680668481740888520785,
+    )
+    assert!(a + b + c + total(s, 3) == MAX_U256)
+}

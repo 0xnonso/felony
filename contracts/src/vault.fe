@@ -1,0 +1,44 @@
+use std::evm::{Address, Call, Ctx}
+use ingot::interfaces::DepositVault
+use std::evm::erc20::{safe_approve, safe_transfer}
+
+pub fn asset_of(_ vault: Address) -> Address uses (call: Call) {
+    call.static(addr: vault, gas: 200000, message: DepositVault::Asset {})
+}
+
+pub fn token_balance(_ token: Address, _ owner: Address) -> u256 uses (call: Call) {
+    call.static(
+        addr: token,
+        gas: 200000,
+        message: DepositVault::BalanceOf { owner },
+    )
+}
+
+pub fn deposit_assets(_ vault: Address, _ asset: Address, _ amount: u256) -> u256
+uses (ctx: Ctx, call: mut Call)
+{
+    assert!(amount > 0 && asset_of(vault) == asset)
+    let owner = ctx.address()
+    let assets_before = token_balance(asset, owner)
+    let shares_before = token_balance(vault, owner)
+    safe_approve(token: asset, spender: vault, amount: 0)
+    safe_approve(token: asset, spender: vault, amount)
+    let reported: u256 = vault.call(DepositVault::Deposit { assets: amount, receiver: owner })
+    safe_approve(token: asset, spender: vault, amount: 0)
+    let shares = token_balance(vault, owner) - shares_before
+    assert!(shares > 0 && reported == shares)
+    assert!(assets_before - token_balance(asset, owner) == amount)
+    shares
+}
+
+pub fn transfer_shares(_ vault: Address, _ to: Address, _ shares: u256)
+uses (ctx: Ctx, call: mut Call)
+{
+    let owner = ctx.address()
+    assert!(to != Address::zero() && to != owner && shares > 0)
+    let own_before = token_balance(vault, owner)
+    let recipient_before = token_balance(vault, to)
+    safe_transfer(token: vault, receiver: to, amount: shares)
+    assert!(own_before - token_balance(vault, owner) == shares)
+    assert!(token_balance(vault, to) - recipient_before == shares)
+}

@@ -1,0 +1,28 @@
+# Rebuildable outputs and local compiler state
+out/
+target/
+.fe-lsp/
+/.fe-lsp.json
+
+# Private witnesses, datasets and model artifacts
+circuit/Prover.toml
+model/data/
+model/artifacts/
+model/runs/
+
+# Local environments, credentials and editor state
+/.vscode/
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.ruff_cache/
+
+# Documentation generator cache
+/.cache/
+
+# Downloaded native tools
+/.tools/

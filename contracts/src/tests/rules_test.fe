@@ -1,0 +1,553 @@
+use ingot::rules::{
+    ALL_CARDS,
+    Board,
+    BoardOutcome,
+    forced,
+    holds,
+    initial,
+    loot_digest,
+    outcome,
+    tournament_outcome,
+    packed,
+    resolve,
+    select_prize,
+}
+
+const SEED: u256 = 5
+
+fn field(_ word: u256, _ shift: u256, _ bits: u256) -> u256 {
+    (word >> shift) & ((1 << bits) - 1)
+}
+
+fn card_mask(_ card: u256) -> u256 {
+    1 << (card - 1)
+}
+
+fn check_game(
+    seed: u256,
+    bids0: [u256; 9],
+    bids1: [u256; 9],
+    prizes: [u256; 9],
+    packed0: [u256; 9],
+    packed1: [u256; 9],
+    score0: u256,
+    score1: u256,
+    result: u256,
+) {
+    var board = initial(seed)
+    for i in 0 .. 9 {
+        assert!(board.round == i as u256)
+        assert!(board.current == prizes[i])
+        assert!(packed(board, 0) == packed0[i])
+        assert!(packed(board, 1) == packed1[i])
+        if i == 8 {
+            assert!(forced(board.hand0) == bids0[i])
+            assert!(forced(board.hand1) == bids1[i])
+        }
+        board = resolve(board, bids0[i], bids1[i], seed)
+    }
+    assert!(board.score0 == score0)
+    assert!(board.score1 == score1)
+    match outcome(board) {
+        BoardOutcome::Seat0Won => assert!(result == 1),
+        BoardOutcome::Seat1Won => assert!(result == 2),
+        BoardOutcome::Draw => assert!(result == 3),
+    }
+    assert!(
+        board.hand0 == 0 && board.hand1 == 0 && board.loot == 0 && board.current == 0,
+    )
+}
+
+fn board_with_prize(_ prize: u256) -> Board {
+    var board = initial(SEED)
+    board.current = prize
+    board
+}
+
+#[test]
+fn loot_digest_matches_abi_encoded_keccak() {
+    assert!(
+        loot_digest(5, 0) == 0x7e3f5420222a4452034d53688474840983a0d47ebe1072b65669968d66945564,
+    )
+}
+
+#[test]
+fn initial_board_is_full_and_uses_the_seed() {
+    let board = initial(SEED)
+    assert!(
+        board.hand0 == ALL_CARDS && board.hand1 == ALL_CARDS && board.loot == ALL_CARDS,
+    )
+    assert!(board.score0 == 0 && board.score1 == 0 && board.round == 0)
+    assert!(board.history0 == 0 && board.history1 == 0)
+    assert!(board.current == select_prize(ALL_CARDS, SEED, 0))
+    assert!(board.current >= 1 && board.current <= 9)
+}
+
+#[test]
+fn prize_selection_only_returns_remaining_prizes() {
+    let loot = card_mask(2) | card_mask(5) | card_mask(9)
+    for round in 0 .. 64 {
+        let prize = select_prize(loot, 77, round as u256)
+        assert!(prize == 2 || prize == 5 || prize == 9)
+    }
+    assert!(select_prize(card_mask(7), 77, 3) == 7)
+}
+
+#[test]
+fn packed_state_uses_the_specified_bit_layout() {
+    var board = board_with_prize(3)
+    board.hand0 = 0x1fe
+    board.hand1 = 0x1fd
+    board.loot = 0x1fb ^ card_mask(1) | card_mask(3)
+    board.score0 = 2
+    board.score1 = 9
+    board.history0 = 0x5 << 0
+    board.history1 = 0x6 << 0
+    let seat0_view = packed(board, 0)
+    assert!(field(seat0_view, 0, 9) == 0x1fe)
+    assert!(field(seat0_view, 9, 9) == 0x1fd)
+    assert!(field(seat0_view, 18, 9) == board.loot)
+    assert!(field(seat0_view, 27, 4) == 3)
+    assert!(field(seat0_view, 31, 7) == 38)
+    assert!(field(seat0_view, 38, 36) == 5)
+    assert!(field(seat0_view, 74, 36) == 6)
+    assert!(seat0_view >> 110 == 0)
+    let seat1_view = packed(board, 1)
+    assert!(field(seat1_view, 0, 9) == 0x1fd)
+    assert!(field(seat1_view, 9, 9) == 0x1fe)
+    assert!(field(seat1_view, 31, 7) == 52)
+    assert!(field(seat1_view, 38, 36) == 6)
+    assert!(field(seat1_view, 74, 36) == 5)
+}
+
+#[test]
+fn higher_bid_wins_the_prize_for_either_seat() {
+    let board = board_with_prize(4)
+    let seat0 = resolve(board, 7, 2, SEED)
+    assert!(seat0.score0 == 4 && seat0.score1 == 0)
+    let seat1 = resolve(board, 2, 7, SEED)
+    assert!(seat1.score0 == 0 && seat1.score1 == 4)
+}
+
+#[test]
+fn tie_burns_the_prize_and_spends_both_cards() {
+    let next = resolve(board_with_prize(6), 3, 3, SEED)
+    assert!(next.score0 == 0 && next.score1 == 0)
+    assert!(next.hand0 == ALL_CARDS ^ card_mask(3))
+    assert!(next.hand1 == ALL_CARDS ^ card_mask(3))
+    assert!(next.loot == ALL_CARDS ^ card_mask(6))
+}
+
+#[test]
+fn resolve_records_history_by_prize_and_advances() {
+    let next = resolve(board_with_prize(9), 8, 1, SEED)
+    assert!(field(next.history0, 32, 4) == 8)
+    assert!(field(next.history1, 32, 4) == 1)
+    assert!(next.history0 >> 36 == 0)
+    assert!(next.round == 1)
+    assert!(next.loot & card_mask(9) == 0)
+    assert!(next.current == select_prize(next.loot, SEED, 1))
+    assert!(next.loot & card_mask(next.current) != 0)
+}
+
+#[test]
+fn resolve_leaves_the_input_board_unchanged() {
+    let board = initial(SEED)
+    let before = packed(board, 0)
+    let _next = resolve(board, 1, 2, SEED)
+    assert!(packed(board, 0) == before)
+}
+
+#[test]
+fn identical_bids_finish_as_a_scoreless_draw() {
+    var board = initial(SEED)
+    for i in 0 .. 9 {
+        let card = (i as u256) + 1
+        board = resolve(board, card, card, SEED)
+    }
+    assert!(board.score0 == 0 && board.score1 == 0)
+    assert!(
+        match outcome(board) {
+            BoardOutcome::Draw => true,
+            _ => false,
+        },
+    )
+}
+
+#[test]
+fn outcome_compares_final_scores() {
+    var board = initial(SEED)
+    board.round = 9
+    board.score0 = 23
+    board.score1 = 22
+    assert!(
+        match outcome(board) {
+            BoardOutcome::Seat0Won => true,
+            _ => false,
+        },
+    )
+    board.score0 = 21
+    assert!(
+        match outcome(board) {
+            BoardOutcome::Seat1Won => true,
+            _ => false,
+        },
+    )
+}
+
+#[test]
+fn forced_returns_the_single_card() {
+    for i in 0 .. 9 {
+        let card = (i as u256) + 1
+        assert!(forced(card_mask(card)) == card)
+    }
+}
+
+#[test]
+fn holds_rejects_cards_outside_the_hand() {
+    let hand = card_mask(1) | card_mask(9)
+    assert!(holds(hand, 1) && holds(hand, 9))
+    assert!(!holds(hand, 0) && !holds(hand, 2) && !holds(hand, 10))
+    assert!(!holds(hand, 1 << 200))
+}
+
+#[test(should_revert)]
+fn bid_zero_is_rejected() {
+    let _ = resolve(initial(SEED), 0, 1, SEED)
+}
+
+#[test(should_revert)]
+fn bid_ten_is_rejected() {
+    let _ = resolve(initial(SEED), 1, 10, SEED)
+}
+
+#[test(should_revert)]
+fn seat0_spent_card_is_rejected() {
+    let next = resolve(initial(SEED), 4, 5, SEED)
+    let _ = resolve(next, 4, 6, SEED)
+}
+
+#[test(should_revert)]
+fn seat1_spent_card_is_rejected() {
+    let next = resolve(initial(SEED), 4, 5, SEED)
+    let _ = resolve(next, 6, 5, SEED)
+}
+
+fn finished_board() -> Board {
+    var board = initial(SEED)
+    for i in 0 .. 9 {
+        let card = (i as u256) + 1
+        board = resolve(board, card, card, SEED)
+    }
+    board
+}
+
+#[test(should_revert)]
+fn finished_game_cannot_continue() {
+    let _ = resolve(finished_board(), 1, 1, SEED)
+}
+
+#[test(should_revert)]
+fn finished_game_has_no_packed_state() {
+    let _ = packed(finished_board(), 0)
+}
+
+#[test(should_revert)]
+fn unfinished_game_has_no_outcome() {
+    let _ = outcome(initial(SEED))
+}
+
+#[test(should_revert)]
+fn third_player_is_rejected() {
+    let _ = packed(initial(SEED), 2)
+}
+
+#[test(should_revert)]
+fn current_prize_must_remain_in_loot() {
+    var board = initial(SEED)
+    board.loot = board.loot ^ card_mask(board.current)
+    let _ = packed(board, 0)
+}
+
+#[test(should_revert)]
+fn forced_rejects_an_empty_hand() {
+    let _ = forced(0)
+}
+
+#[test(should_revert)]
+fn forced_rejects_two_cards() {
+    let _ = forced(card_mask(1) | card_mask(2))
+}
+
+#[test(should_revert)]
+fn forced_rejects_bits_outside_the_deck() {
+    let _ = forced(1 << 9)
+}
+
+#[test(should_revert)]
+fn selection_rejects_empty_loot() {
+    let _ = select_prize(0, SEED, 0)
+}
+
+#[test]
+fn python_reference_game_0() {
+    check_game(
+        seed: 0x0,
+        bids0: [9, 8, 5, 7, 2, 1, 6, 4, 3],
+        bids1: [7, 8, 9, 2, 1, 6, 3, 5, 4],
+        prizes: [8, 9, 6, 3, 1, 2, 4, 5, 7],
+        packed0: [
+            0x16c7ffffff,
+            0x1c0000000240000001acdff7eff,
+            0x21c0000002240000001ab1fe7e7f,
+            0x21c24000022414000017997c7e6f,
+            0x21c2400802241401c019096c7a2f,
+            0x21c2400806241401c0999168782d,
+            0x21c2400986241401c498a160382c,
+            0x21c240c986241419c49aa940300c,
+            0x21c254c986241519c49839001004,
+        ],
+        packed1: [
+            0x16c7ffffff,
+            0x2400000001c00000012cdfdffbf,
+            0x22400000021c00000012b1fcff3f,
+            0x22414000021c24000015997cde3f,
+            0x2241401c021c24008014096c5e3d,
+            0x2241401c0a1c2400805391685a3c,
+            0x2241401c4a1c24009854a160581c,
+            0x2241419c4a1c240c9852a9401818,
+            0x2241519c4a1c254c985539000808,
+        ],
+        score0: 16,
+        score1: 20,
+        result: 2,
+    )
+}
+
+#[test]
+fn python_reference_game_1() {
+    check_game(
+        seed: 0x1,
+        bids0: [3, 5, 7, 2, 6, 8, 1, 9, 4],
+        bids1: [1, 6, 9, 7, 4, 2, 8, 5, 3],
+        prizes: [3, 6, 9, 5, 2, 7, 8, 4, 1],
+        packed0: [
+            0x169fffffff,
+            0x400000000c01837effdfb,
+            0x1800400001400c0154f6fbdeb,
+            0x2401800401c01400c010ab6dbdab,
+            0x24019c0401c01480c00e132d3da9,
+            0x24019c0501c01480d80f3b252d89,
+            0x24099c0501c21480d812c2252909,
+            0x26099c0501c61480d80ea0242908,
+            0x26099d4501c614a4d81088040808,
+        ],
+        packed1: [
+            0x169fffffff,
+            0xc00000000401537eff7fe,
+            0x1400c0000180040184f6fd7de,
+            0x1c01400c02401800401cab6f56de,
+            0x1c01480c024019c0401f132f529e,
+            0x1c01480d824019c0501e3b271296,
+            0x1c21480d824099c0501ac2261294,
+            0x1c61480d826099c0501ea0261014,
+            0x1c614a4d826099d4501c88041004,
+        ],
+        score0: 17,
+        score1: 28,
+        result: 2,
+    )
+}
+
+#[test]
+fn python_reference_game_2() {
+    check_game(
+        seed: 0xcafe123456789,
+        bids0: [8, 9, 5, 4, 7, 3, 6, 2, 1],
+        bids1: [2, 4, 8, 1, 3, 9, 6, 5, 7],
+        prizes: [2, 1, 9, 6, 8, 5, 4, 3, 7],
+        packed0: [
+            0x1697ffffff,
+            0x8000000020178ff7fb7f,
+            0x9000000022584ff3ea7f,
+            0x20000000914000002253b3f2ea6f,
+            0x20004000914010002256c372e867,
+            0x20c04000915c1000225aa972e027,
+            0x20c06400915c10c022582130e023,
+            0x20c06580915c10d822581910a003,
+            0x20c06594915c10d8a256b9008001,
+        ],
+        packed1: [
+            0x1697ffffff,
+            0x20000000008158ff6fffd,
+            0x22400000009154ff0fff5,
+            0x14000002260000000919b3f0df75,
+            0x14010002260004000916c370cf74,
+            0x15c10002260c04000912a9704f70,
+            0x15c10c02260c0640091521304670,
+            0x15c10d82260c0658091519100650,
+            0x15c10d8a260c06594916b9000240,
+        ],
+        score0: 17,
+        score1: 24,
+        result: 2,
+    )
+}
+
+#[test]
+fn python_reference_game_3() {
+    check_game(
+        seed: 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000000,
+        bids0: [8, 3, 1, 9, 2, 6, 4, 7, 5],
+        bids1: [9, 6, 2, 3, 1, 5, 4, 8, 7],
+        prizes: [2, 8, 5, 6, 1, 9, 4, 7, 3],
+        packed0: [
+            0x1697ffffff,
+            0x2400000002015c7f5ff7f,
+            0x1800002400c00002011adf5bf7b,
+            0x1800802400c0040200f35b5bb7a,
+            0x180c802400c244020120d35b27a,
+            0x180c802440c24402092cd31b078,
+            0x1580c802458c2440209721319058,
+            0x1580c902458c2450209739118050,
+            0x15a0c902458de450209398108010,
+        ],
+        packed1: [
+            0x1697ffffff,
+            0x2000000002417c7f6feff,
+            0xc0000200180000241badf6f6df,
+            0xc0040200180080241e35b6f4dd,
+            0xc2440200180c80241b0d34f4d9,
+            0xc2440208180c80245acd30f0d8,
+            0x18c2440209580c8024562130b0c8,
+            0x18c2450209580c9024563910a0c0,
+            0x18de4502095a0c90245998102040,
+        ],
+        score0: 16,
+        score1: 25,
+        result: 2,
+    )
+}
+
+#[test]
+fn python_reference_game_4() {
+    check_game(
+        seed: 0x181513700ba3f10b130e888e57c723ac34296a83d4a8142aa7f8c874e6b9197d,
+        bids0: [5, 2, 8, 6, 3, 1, 7, 4, 9],
+        bids1: [3, 8, 9, 1, 2, 6, 4, 7, 5],
+        prizes: [4, 6, 2, 3, 5, 8, 9, 1, 7],
+        packed0: [
+            0x16a7ffffff,
+            0xc0000000140018b7dff7ef,
+            0x200c0000008140015975ef7ed,
+            0x200c24000081420149f54f76d,
+            0x200c640000815a0162f44f54d,
+            0x208c6400008d5a018c704f149,
+            0x18208c6400408d5a014cd04b148,
+            0x118208c641c408d5a0190904a108,
+            0x118208c65dc408d5a118b9002100,
+        ],
+        packed1: [
+            0x16a7ffffff,
+            0x1400000000c0014b7dfdffb,
+            0x81400000200c0017975fdb7b,
+            0x81420000200c24189f56da7b,
+            0x815a0000200c64172f469a7a,
+            0x8d5a0000208c6414c7069278,
+            0x408d5a0018208c6418cd069058,
+            0x1c408d5a0118208c641409061050,
+            0x1c408d5a1118208c65d4b9020010,
+        ],
+        score0: 28,
+        score1: 17,
+        result: 1,
+    )
+}
+
+#[test]
+fn python_reference_game_5() {
+    check_game(
+        seed: 0x1674416d6c6b0b41b40b03947ea321be50eb3506619cd31d39a03de804a199eb,
+        bids0: [3, 7, 6, 5, 2, 8, 4, 9, 1],
+        bids1: [1, 2, 5, 7, 4, 6, 8, 3, 9],
+        prizes: [7, 3, 6, 2, 5, 9, 4, 1, 8],
+        packed0: [
+            0x16bfffffff,
+            0x400000000c000001a1efffdfb,
+            0x400080000c001c01bb6eff9bb,
+            0x540080000d801c01e966fd99b,
+            0x54009c000d801d41dae67598b,
+            0x55009c000d881d41b4e274989,
+            0x18055009c200d881d41fa2270909,
+            0x18055209c200d891d41d8a060901,
+            0x18055209ce00d891d65e42020001,
+        ],
+        packed1: [
+            0x16bfffffff,
+            0xc00000000400000131efff7fe,
+            0xc001c000040008011b6ef77fc,
+            0xd801c00005400800e966f37ec,
+            0xd801d400054009c0fae6717ac,
+            0xd881d400055009c124e2713a4,
+            0x200d881d418055009c0da2261384,
+            0x200d891d418055209c0f8a060304,
+            0x200d891d658055209ccf42000300,
+        ],
+        score0: 26,
+        score1: 19,
+        result: 1,
+    )
+}
+
+#[test]
+fn tournament_score_ties_use_highest_capture() {
+    let a: [u256; 9] = [4, 1, 7, 6, 2, 5, 8, 3, 9]
+    let b: [u256; 9] = [7, 6, 1, 4, 5, 8, 2, 3, 9]
+    var board = initial(SEED)
+    while board.round < 9 {
+        let index: usize = (board.current - 1).downcast_unchecked()
+        board = resolve(board, a[index], b[index], SEED)
+    }
+    assert!(board.score0 == 14 && board.score1 == 14)
+    assert!(
+        match outcome(board) {
+            BoardOutcome::Draw => true,
+            _ => false,
+        },
+    )
+    assert!(
+        match tournament_outcome(board) {
+            BoardOutcome::Seat0Won => true,
+            _ => false,
+        },
+    )
+
+    board = initial(SEED)
+    while board.round < 9 {
+        let prize = board.current
+        let other = if prize == 9 { 1 } else { prize + 1 }
+        board = resolve(board, prize, other, SEED)
+    }
+    assert!(board.score0 == 9 && board.score1 == 36)
+    assert!(
+        match tournament_outcome(board) {
+            BoardOutcome::Seat1Won => true,
+            _ => false,
+        },
+    )
+}
+
+#[test]
+fn tournament_all_burn_remains_drawn_for_controller_coin() {
+    var board = initial(SEED)
+    while board.round < 9 {
+        let bid = board.round + 1
+        board = resolve(board, bid, bid, SEED)
+    }
+    assert!(
+        match tournament_outcome(board) {
+            BoardOutcome::Draw => true,
+            _ => false,
+        },
+    )
+}

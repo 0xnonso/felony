@@ -1,0 +1,398 @@
+use std::evm::{Address, StorageMap}
+use std::evm::mutex::Mutex
+use ingot::rules::{Board, BoardOutcome}
+
+pub enum MatchPhase {
+    Uninitialized,
+    Invited,
+    AwaitingRandomness,
+    Playing,
+    Finished,
+    Cancelled,
+}
+impl Copy for MatchPhase {}
+impl MatchPhase {
+    pub fn is_invited(self) -> bool {
+        match self {
+            Self::Invited => true,
+            _ => false,
+        }
+    }
+    pub fn is_awaiting_randomness(self) -> bool {
+        match self {
+            Self::AwaitingRandomness => true,
+            _ => false,
+        }
+    }
+    pub fn is_playing(self) -> bool {
+        match self {
+            Self::Playing => true,
+            _ => false,
+        }
+    }
+    pub fn code(self) -> u256 {
+        match self {
+            Self::Uninitialized => 0,
+            Self::Invited => 1,
+            Self::AwaitingRandomness => 2,
+            Self::Playing => 3,
+            Self::Finished => 4,
+            Self::Cancelled => 5,
+        }
+    }
+}
+
+pub enum MatchResult {
+    Pending,
+    Player0Win,
+    Player1Win,
+    Draw,
+    Player0Defaulted,
+    Player1Defaulted,
+    DoubleDefault,
+}
+impl Copy for MatchResult {}
+impl MatchResult {
+    pub fn code(self) -> u256 {
+        match self {
+            Self::Pending => 0,
+            Self::Player0Win | Self::Player1Defaulted => 1,
+            Self::Player1Win | Self::Player0Defaulted => 2,
+            Self::Draw => 3,
+            Self::DoubleDefault => 4,
+        }
+    }
+    pub fn defaulted(self) -> bool {
+        match self {
+            Self::Player0Defaulted | Self::Player1Defaulted | Self::DoubleDefault => true,
+            _ => false,
+        }
+    }
+    pub fn from_board(_ result: BoardOutcome) -> Self {
+        match result {
+            BoardOutcome::Seat0Won => Self::Player0Win,
+            BoardOutcome::Seat1Won => Self::Player1Win,
+            BoardOutcome::Draw => Self::Draw,
+        }
+    }
+    pub fn timeout(_ ready_mask: u256) -> Self {
+        match ready_mask {
+            1 => Self::Player1Defaulted,
+            2 => Self::Player0Defaulted,
+            0 => Self::DoubleDefault,
+            _ => {
+                assert!(false)
+                Self::Pending
+            },
+        }
+    }
+}
+
+pub struct Game {
+    pub player0: Address,
+    pub player1: Address,
+    pub commitment0: u256,
+    pub commitment1: u256,
+    pub stake: u256,
+    pub phase: MatchPhase,
+    pub deadline: u256,
+    pub turn_seconds: u256,
+    pub seed: u256,
+    pub board: Board,
+    pub submitted: u256,
+    pub bid0: u256,
+    pub bid1: u256,
+    pub result: MatchResult,
+    pub tournament: u256,
+    pub manager: Address,
+    pub request_id: u256,
+}
+impl Copy for Game {}
+
+pub struct MatchReservation { pub first: u256, pub count: u256 }
+impl Copy for MatchReservation {}
+
+pub struct ArenaStore {
+    pub guard: Mutex<()>,
+    pub waiting: StorageMap<u256, u256>,
+    pub next_game: u256,
+    pub reservations: StorageMap<u256, MatchReservation>,
+    pub games: StorageMap<u256, Game>,
+    pub busy: StorageMap<Address, u256>,
+    pub credits: StorageMap<Address, u256>,
+    pub liabilities: u256,
+    pub burned: u256,
+}
+
+pub enum TournamentPhase {
+    Uninitialized,
+    Open,
+    AwaitingFunding,
+    Running,
+    Settled,
+    Aborted,
+    Cancelled,
+}
+
+impl Copy for TournamentPhase {}
+
+impl TournamentPhase {
+    pub fn code(self) -> u256 {
+        match self {
+            Self::Uninitialized => 0,
+            Self::Open => 1,
+            Self::AwaitingFunding => 2,
+            Self::Running => 3,
+            Self::Settled => 4,
+            Self::Aborted => 5,
+            Self::Cancelled => 6,
+        }
+    }
+
+    pub fn is_open(self) -> bool {
+        match self {
+            Self::Open => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_awaiting_funding(self) -> bool {
+        match self {
+            Self::AwaitingFunding => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_running(self) -> bool {
+        match self {
+            Self::Running => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_paying_shares(self) -> bool {
+        match self {
+            Self::Settled | Self::Aborted => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_aborted(self) -> bool {
+        match self {
+            Self::Aborted => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_cancelled(self) -> bool {
+        match self {
+            Self::Cancelled => true,
+            _ => false,
+        }
+    }
+}
+
+pub enum RoundStage {
+    Window,
+    Drawing,
+    Active,
+}
+
+impl Copy for RoundStage {}
+
+impl RoundStage {
+    pub fn code(self) -> u256 {
+        match self {
+            Self::Window => 0,
+            Self::Drawing => 1,
+            Self::Active => 2,
+        }
+    }
+
+    pub fn is_window(self) -> bool {
+        match self {
+            Self::Window => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_drawing(self) -> bool {
+        match self {
+            Self::Drawing => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        match self {
+            Self::Active => true,
+            _ => false,
+        }
+    }
+}
+
+pub enum EntryStatus {
+    Uninitialized,
+    Eligible,
+    Forfeited,
+}
+impl Copy for EntryStatus {}
+impl EntryStatus {
+    pub fn code(self) -> u256 {
+        match self {
+            Self::Uninitialized => 0,
+            Self::Eligible => 1,
+            Self::Forfeited => 2,
+        }
+    }
+    pub fn is_forfeited(self) -> bool {
+        match self {
+            Self::Forfeited => true,
+            _ => false,
+        }
+    }
+}
+
+pub enum MatchOutcome {
+    Seat0Won,
+    Seat1Won,
+    Draw,
+    BothDefaulted,
+}
+
+impl Copy for MatchOutcome {}
+
+impl MatchOutcome {
+    pub fn from_code(_ code: u256) -> MatchOutcome {
+        assert!(code >= 1 && code <= 4)
+        if code == 1 {
+            MatchOutcome::Seat0Won
+        } else if code == 2 {
+            MatchOutcome::Seat1Won
+        } else if code == 3 {
+            MatchOutcome::Draw
+        } else {
+            MatchOutcome::BothDefaulted
+        }
+    }
+}
+
+pub struct Tournament {
+    pub manager: Address,
+    pub max_capacity: u256,
+    pub fund_seconds: u256,
+    pub window_seconds: u256,
+    pub turn_seconds: u256,
+    pub phase: TournamentPhase,
+    pub capacity: u256,
+    pub count: u256,
+    pub principal: u256,
+    pub entry_end: u256,
+    pub fund_by: u256,
+    pub round: u256,
+    pub stage: RoundStage,
+    pub until: u256,
+    pub request: u256,
+    pub pending: u256,
+    pub shares: u256,
+    pub forfeits: u256,
+    pub places: [u256; 3],
+    pub remainder_slot: u256,
+}
+
+impl Copy for Tournament {}
+
+pub struct Entry {
+    pub player: Address,
+    pub commitment: u256,
+    pub status: EntryStatus,
+    pub claimed: bool,
+    pub deducted: u256,
+    pub reached: u256,
+    pub updated: u256,
+}
+
+impl Copy for Entry {}
+
+pub enum BracketMatch {
+    Pending,
+    InArena { pub match_id: u256 },
+    Resolved {
+        pub winner: u256,
+        pub loser: u256,
+    },
+}
+
+impl Copy for BracketMatch {}
+
+impl BracketMatch {
+    pub fn view(self) -> [u256; 4] {
+        match self {
+            Self::Pending => [0, 0, 0, 0],
+            Self::InArena { match_id } => [1, 0, 0, match_id],
+            Self::Resolved { winner, loser } => [2, winner, loser, 0],
+        }
+    }
+}
+
+pub struct Payout {
+    pub value: u256,
+    pub scale: u256,
+    pub prizes: [u256; 3],
+    pub bonus: u256,
+    pub remainder: u256,
+    pub fee: u256,
+    pub unowned: u256,
+}
+
+impl Copy for Payout {}
+
+pub struct TournamentStore {
+    pub guard: Mutex<()>,
+    pub next_id: u256,
+    pub tournaments: StorageMap<u256, Tournament>,
+    pub entries: StorageMap<u256, Entry>,
+    pub slots: StorageMap<u256, u256>,
+    pub matches: StorageMap<u256, BracketMatch>,
+    pub roots: StorageMap<u256, u256>,
+    pub words: StorageMap<u256, u256>,
+    pub eligible: StorageMap<u256, u256>,
+    pub payouts: StorageMap<u256, Payout>,
+    pub fee_claimed: StorageMap<u256, bool>,
+    pub credits: StorageMap<Address, u256>,
+    pub liabilities: u256,
+    pub owed_shares: u256,
+}
+
+pub enum OracleRequestState {
+    Unknown,
+    Pending,
+    Ready,
+}
+impl Copy for OracleRequestState {}
+impl OracleRequestState {
+    pub fn is_ready(self) -> bool {
+        match self {
+            Self::Unknown => {
+                assert!(false)
+                false
+            },
+            Self::Pending => false,
+            Self::Ready => true,
+        }
+    }
+}
+pub struct OracleRequest {
+    pub state: OracleRequestState,
+    pub consumer: Address,
+    pub deadline: u256,
+    pub word: u256,
+}
+impl Copy for OracleRequest {}
+pub struct OracleStore {
+    pub requests: StorageMap<u256, OracleRequest>,
+    pub contexts: StorageMap<u256, bool>,
+    pub consumers: StorageMap<Address, bool>,
+    pub guard: Mutex<()>,
+    pub fees: u256,
+}

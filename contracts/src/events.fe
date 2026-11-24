@@ -1,0 +1,99 @@
+use std::abi::Bytes32
+use std::evm::Address
+
+#[event]
+pub struct GameChanged {
+    #[indexed]
+    pub id: u256,
+    pub phase: u256,
+    pub round: u256,
+    pub submitted: u256,
+    pub result: u256,
+}
+#[event]
+pub struct MoveAccepted {
+    #[indexed]
+    pub id: u256,
+    pub round: u256,
+    pub seat: u256,
+    pub action: u256,
+}
+
+#[event]
+pub struct EntryClaimed {
+    #[indexed]
+    pub id: u256,
+    pub slot: u256,
+}
+
+#[event]
+pub struct Withdrawal {
+    #[indexed]
+    pub player: Address,
+    pub to: Address,
+    pub amount: u256,
+}
+
+#[event]
+pub struct TournamentChanged {
+    #[indexed]
+    pub id: u256,
+    pub phase: u256,
+    pub count: u256,
+}
+
+#[event]
+pub struct RoundChanged {
+    #[indexed]
+    pub id: u256,
+    pub round: u256,
+    pub stage: u256,
+    pub until: u256,
+    pub request: u256,
+}
+
+#[event]
+pub struct ModelUpdated {
+    #[indexed]
+    pub id: u256,
+    pub slot: u256,
+    pub commitment: u256,
+    pub deducted: u256,
+}
+
+#[event]
+pub struct BracketMatchChanged {
+    #[indexed]
+    pub id: u256,
+    #[indexed]
+    pub index: u256,
+    pub state: u256,
+    pub winner: u256,
+    pub loser: u256,
+    pub match_id: u256,
+}
+
+#[event]
+pub struct RandomnessReady {
+    #[indexed]
+    pub request_id: u256,
+    pub random_word: u256,
+}
+
+#[event]
+pub struct RandomnessRequested {
+    #[indexed]
+    pub request_id: u256,
+    #[indexed]
+    pub consumer: Address,
+    pub context: Bytes32,
+    pub deadline: u256,
+}
+#[event]
+pub struct ConsumerChanged {
+    #[indexed]
+    pub consumer: Address,
+    pub allowed: bool,
+}
+#[event]
+pub struct FeesWithdrawn { pub to: Address, pub amount: u256 }

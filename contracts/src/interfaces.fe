@@ -1,0 +1,209 @@
+use std::abi::{sol, Bytes, Bytes32, DynArray}
+use std::evm::Address
+
+pub msg InferenceVerifier {
+    #[selector = sol("verify(bytes,bytes32[])")]
+    Verify { proof: Bytes, public_inputs: DynArray<Bytes32> } -> bool,
+}
+
+pub msg Arena {
+    #[selector = sol("createChallenge(address,uint256,uint256,uint256)")]
+    CreateChallenge {
+        opponent: Address,
+        commitment: u256,
+        stake: u256,
+        join_seconds: u256,
+    } -> u256,
+    #[selector = sol("joinChallenge(uint256,uint256)")]
+    JoinChallenge { id: u256, commitment: u256 },
+    #[selector = sol("cancelChallenge(uint256)")]
+    CancelChallenge { id: u256 },
+    #[selector = sol("joinQueue(uint256,uint256)")]
+    JoinQueue { commitment: u256, stake: u256 } -> u256,
+    #[selector = sol("activateMatch(uint256)")]
+    ActivateMatch { id: u256 },
+    #[selector = sol("randomnessRequest(uint256)")]
+    RandomnessRequest { id: u256 } -> u256,
+    #[selector = sol("queueHead(uint256)")]
+    QueueHead { stake: u256 } -> u256,
+    #[selector = sol("settings()")]
+    Settings -> [u256; 5],
+    #[selector = sol("submitMove(uint256,uint256,bytes)")]
+    SubmitMove { id: u256, action: u256, proof: Bytes },
+    #[selector = sol("forfeit(uint256)")]
+    Forfeit { id: u256 },
+    #[selector = sol("claimTimeout(uint256)")]
+    ClaimTimeout { id: u256 },
+    #[selector = sol("withdraw(address)")]
+    Withdraw { to: Address },
+    #[selector = sol("reserveManagedMatches(uint256,uint256)")]
+    ReserveManagedMatches { tournament: u256, count: u256 } -> u256,
+    #[selector = sol("managedMatchId(address,uint256,uint256)")]
+    ManagedMatchId { manager: Address, tournament: u256, index: u256 } -> u256,
+    #[selector = sol(
+        "createManagedMatch(address,address,uint256,uint256,uint256,uint256,uint256,uint256)",
+    )]
+    CreateManagedMatch {
+        player0: Address,
+        player1: Address,
+        commitment0: u256,
+        commitment1: u256,
+        tournament: u256,
+        seed: u256,
+        turn_seconds: u256,
+        index: u256,
+    } -> u256,
+    #[selector = sol("managedInfo(uint256)")]
+    ManagedInfo { id: u256 } -> [u256; 4],
+    #[selector = sol("creditOf(address)")]
+    CreditOf { player: Address } -> u256,
+    #[selector = sol("busy(address)")]
+    Busy { player: Address } -> u256,
+    #[selector = sol("burned()")]
+    Burned -> u256,
+    #[selector = sol("liabilities()")]
+    Liabilities -> u256,
+    #[selector = sol("matchInfo(uint256)")]
+    MatchInfo { id: u256 } -> [u256; 18],
+    #[selector = sol("proofInputs(uint256,uint256,uint256)")]
+    ProofInputs { id: u256, player: u256, action: u256 } -> [u256; 9],
+}
+
+pub msg TournamentMsg {
+    #[selector = sol(
+        "createTournament(uint256,uint256,uint256,uint256,uint256,uint256)",
+    )]
+    Create {
+        capacity: u256,
+        principal: u256,
+        entry_seconds: u256,
+        fund_seconds: u256,
+        window_seconds: u256,
+        turn_seconds: u256,
+    } -> u256,
+    #[selector = sol("join(uint256,uint256)")]
+    Join { id: u256, commitment: u256 },
+    #[selector = sol("leave(uint256)")]
+    Leave { id: u256 },
+    #[selector = sol("cancel(uint256)")]
+    Cancel { id: u256 },
+    #[selector = sol("start(uint256)")]
+    Start { id: u256 },
+    #[selector = sol("fund(uint256)")]
+    Fund { id: u256 },
+    #[selector = sol("requestDraw(uint256)")]
+    RequestDraw { id: u256 },
+    #[selector = sol("beginRound(uint256)")]
+    BeginRound { id: u256 },
+    #[selector = sol("abort(uint256)")]
+    Abort { id: u256 },
+    #[selector = sol("openMatch(uint256,uint256,uint256,uint256,uint256[9])")]
+    OpenMatch { id: u256, index: u256, slot0: u256, slot1: u256, siblings: [u256; 9] },
+    #[selector = sol("advance(uint256,uint256)")]
+    Advance { id: u256, index: u256 },
+    #[selector = sol("updateModel(uint256,uint256)")]
+    UpdateModel { id: u256, commitment: u256 },
+    #[selector = sol("finalize(uint256)")]
+    Finalize { id: u256 },
+    #[selector = sol("claim(uint256)")]
+    Claim { id: u256 },
+    #[selector = sol("claimFees(uint256)")]
+    ClaimFees { id: u256 },
+    #[selector = sol("withdraw(address)")]
+    Withdraw { to: Address },
+    #[selector = sol("tournamentInfo(uint256)")]
+    TournamentInfo { id: u256 } -> [u256; 18],
+    #[selector = sol("roundInfo(uint256)")]
+    RoundInfo { id: u256 } -> [u256; 7],
+    #[selector = sol("entryInfo(uint256,uint256)")]
+    EntryInfo { id: u256, slot: u256 } -> [u256; 6],
+    #[selector = sol("entitlement(uint256,uint256)")]
+    EntitlementOf { id: u256, slot: u256 } -> u256,
+    #[selector = sol("payoutInfo(uint256)")]
+    PayoutInfo { id: u256 } -> [u256; 9],
+    #[selector = sol("slotOf(uint256,address)")]
+    SlotOf { id: u256, player: Address } -> u256,
+    #[selector = sol("bracketRoot(uint256)")]
+    BracketRoot { id: u256 } -> u256,
+    #[selector = sol("bracketMatch(uint256,uint256)")]
+    BracketMatchInfo { id: u256, index: u256 } -> [u256; 4],
+    #[selector = sol("drawWord(uint256,uint256)")]
+    DrawWord { id: u256, draw: u256 } -> u256,
+    #[selector = sol("creditOf(address)")]
+    CreditOf { player: Address } -> u256,
+    #[selector = sol("accounting()")]
+    Accounting -> [u256; 2],
+    #[selector = sol("settings()")]
+    Settings -> [u256; 5],
+    #[selector = sol("tournamentConfig(uint256)")]
+    TournamentConfig { id: u256 } -> [u256; 5],
+}
+
+pub msg DepositVault {
+    #[selector = sol("asset()")]
+    Asset -> Address,
+    #[selector = sol("deposit(uint256,address)")]
+    Deposit { assets: u256, receiver: Address } -> u256,
+    #[selector = sol("redeem(uint256,address,address)")]
+    Redeem { shares: u256, receiver: Address, owner: Address } -> u256,
+    #[selector = sol("previewRedeem(uint256)")]
+    PreviewRedeem { shares: u256 } -> u256,
+    #[selector = sol("convertToAssets(uint256)")]
+    ConvertToAssets { shares: u256 } -> u256,
+    #[selector = sol("balanceOf(address)")]
+    BalanceOf { owner: Address } -> u256,
+    #[selector = sol("transfer(address,uint256)")]
+    Transfer { to: Address, amount: u256 } -> bool,
+}
+
+pub msg WrappedNative {
+    #[selector = sol("deposit()")]
+    Deposit,
+    #[selector = sol("withdraw(uint256)")]
+    Withdraw { amount: u256 },
+}
+
+pub msg IRandomOracle {
+    #[selector = sol("quoteFee()")]
+    QuoteFee -> u256,
+    #[selector = sol("requestRandomness(bytes32)")]
+    RequestRandomness { context: Bytes32 } -> u256,
+    #[selector = sol("getRandomness(uint256)")]
+    GetRandomness { request_id: u256 } -> u256,
+    #[selector = sol("isReady(uint256)")]
+    IsReady { request_id: u256 } -> bool,
+    #[selector = sol("status(uint256)")]
+    Status { request_id: u256 } -> u256,
+}
+
+#[abi]
+pub struct RandomWordsRequest {
+    pub key_hash: Bytes32,
+    pub sub_id: u256,
+    pub confirmations: u16,
+    pub callback_gas_limit: u32,
+    pub num_words: u32,
+    pub extra_args: Bytes,
+}
+pub msg VRFCoordinator {
+    #[selector = sol(
+        "requestRandomWords((bytes32,uint256,uint16,uint32,uint32,bytes))",
+    )]
+    RequestRandomWords { request: RandomWordsRequest } -> u256,
+}
+pub msg OracleAdmin {
+    #[selector = sol("rawFulfillRandomWords(uint256,uint256[])")]
+    Fulfill { request_id: u256, words: DynArray<u256> },
+    #[selector = sol("setConsumer(address,bool)")]
+    SetConsumer { consumer: Address, allowed: bool },
+    #[selector = sol("isConsumer(address)")]
+    IsConsumer { consumer: Address } -> bool,
+    #[selector = sol("requestInfo(uint256)")]
+    RequestInfo { request_id: u256 } -> [u256; 3],
+    #[selector = sol("settings()")]
+    Settings -> [u256; 9],
+    #[selector = sol("withdrawFees(address)")]
+    WithdrawFees { to: Address },
+    #[selector = sol("fees()")]
+    Fees -> u256,
+}

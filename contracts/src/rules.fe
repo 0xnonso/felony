@@ -1,0 +1,197 @@
+use core::num::trailing_zeros
+use std::evm::keccak_words
+
+pub const CARDS: u256 = 9
+pub const ALL_CARDS: u256 = 0x1ff
+pub const LOOT_DOMAIN: u256 = 204
+pub const RULES_VERSION: u256 = 1
+pub const SCORE_OFFSET: u256 = 45
+
+pub enum BoardOutcome {
+    Seat0Won,
+    Seat1Won,
+    Draw,
+}
+impl Copy for BoardOutcome {}
+
+const OPPONENT_HAND_SHIFT: u256 = 9
+const LOOT_SHIFT: u256 = 18
+const CURRENT_SHIFT: u256 = 27
+const SCORE_SHIFT: u256 = 31
+const OWN_HISTORY_SHIFT: u256 = 38
+const OPPONENT_HISTORY_SHIFT: u256 = 74
+const HISTORY_BITS: u256 = 4
+
+pub struct Board {
+    pub hand0: u256,
+    pub hand1: u256,
+    pub loot: u256,
+    pub current: u256,
+    pub score0: u256,
+    pub score1: u256,
+    pub history0: u256,
+    pub history1: u256,
+    pub round: u256,
+}
+
+impl Copy for Board {}
+
+fn card_bit(_ card: u256) -> u256 {
+    assert!(card >= 1 && card <= CARDS)
+    1 << (card - 1)
+}
+
+fn count_cards(_ mask: u256) -> u256 {
+    var count: u256 = 0
+    for i in 0 .. 9 {
+        count += (mask >> (i as u256)) & 1
+    }
+    count
+}
+
+fn nth_card(_ mask: u256, _ index: u256) -> u256 {
+    var seen: u256 = 0
+    for i in 0 .. 9 {
+        let position = i as u256
+        if (mask >> position) & 1 == 1 {
+            if seen == index {
+                return position + 1
+            }
+            seen += 1
+        }
+    }
+    assert!(false)
+    0
+}
+
+pub fn loot_digest(_ seed: u256, _ round: u256) -> u256 {
+    keccak_words([LOOT_DOMAIN, RULES_VERSION, seed, round])
+}
+
+pub fn select_prize(_ loot: u256, _ seed: u256, _ round: u256) -> u256 {
+    assert!(loot > 0 && loot <= ALL_CARDS)
+    nth_card(loot, loot_digest(seed, round) % count_cards(loot))
+}
+
+pub fn initial(_ seed: u256) -> Board {
+    Board {
+        hand0: ALL_CARDS,
+        hand1: ALL_CARDS,
+        loot: ALL_CARDS,
+        current: select_prize(ALL_CARDS, seed, 0),
+        score0: 0,
+        score1: 0,
+        history0: 0,
+        history1: 0,
+        round: 0,
+    }
+}
+
+fn assert_in_play(_ board: Board) {
+    assert!(board.round < CARDS)
+    assert!(board.loot & card_bit(board.current) != 0)
+}
+
+pub fn packed(_ board: Board, _ player: u256) -> u256 {
+    assert!(player < 2)
+    assert_in_play(board)
+    let seat0 = player == 0
+    let own_hand = if seat0 { board.hand0 } else { board.hand1 }
+    let opponent_hand = if seat0 { board.hand1 } else { board.hand0 }
+    let own_score = if seat0 { board.score0 } else { board.score1 }
+    let opponent_score = if seat0 { board.score1 } else { board.score0 }
+    let own_history = if seat0 {
+        board.history0
+    } else {
+        board.history1
+    }
+    let opponent_history = if seat0 {
+        board.history1
+    } else {
+        board.history0
+    }
+    own_hand
+        | (opponent_hand << OPPONENT_HAND_SHIFT)
+        | (board.loot << LOOT_SHIFT)
+        | (board.current << CURRENT_SHIFT)
+        | ((SCORE_OFFSET + own_score - opponent_score) << SCORE_SHIFT)
+        | (own_history << OWN_HISTORY_SHIFT)
+        | (opponent_history << OPPONENT_HISTORY_SHIFT)
+}
+
+pub fn holds(_ hand: u256, _ card: u256) -> bool {
+    card >= 1 && card <= CARDS && hand & (1 << (card - 1)) != 0
+}
+
+pub fn resolve(_ board: Board, _ bid0: u256, _ bid1: u256, _ seed: u256) -> Board {
+    assert_in_play(board)
+    assert!(holds(board.hand0, bid0))
+    assert!(holds(board.hand1, bid1))
+    let prize = board.current
+    let history_shift = HISTORY_BITS * (prize - 1)
+    let loot = board.loot ^ card_bit(prize)
+    let round = board.round + 1
+    Board {
+        hand0: board.hand0 ^ card_bit(bid0),
+        hand1: board.hand1 ^ card_bit(bid1),
+        loot,
+        current: if round < CARDS {
+            select_prize(loot, seed, round)
+        } else {
+            0
+        },
+        score0: if bid0 > bid1 {
+            board.score0 + prize
+        } else {
+            board.score0
+        },
+        score1: if bid1 > bid0 {
+            board.score1 + prize
+        } else {
+            board.score1
+        },
+        history0: board.history0 | (bid0 << history_shift),
+        history1: board.history1 | (bid1 << history_shift),
+        round,
+    }
+}
+
+pub fn forced(_ hand: u256) -> u256 {
+    assert!(hand > 0 && hand <= ALL_CARDS && count_cards(hand) == 1)
+    trailing_zeros(hand) + 1
+}
+
+pub fn outcome(_ board: Board) -> BoardOutcome {
+    assert!(board.round == CARDS)
+    if board.score0 > board.score1 {
+        BoardOutcome::Seat0Won
+    } else if board.score1 > board.score0 {
+        BoardOutcome::Seat1Won
+    } else {
+        BoardOutcome::Draw
+    }
+}
+
+pub fn tournament_outcome(_ board: Board) -> BoardOutcome {
+    let result = outcome(board)
+    match result {
+        BoardOutcome::Draw => {},
+        _ => {
+            return result
+        },
+    }
+    var prize = CARDS
+    while prize > 0 {
+        let shift = HISTORY_BITS * (prize - 1)
+        let bid0 = (board.history0 >> shift) & 15
+        let bid1 = (board.history1 >> shift) & 15
+        if bid0 > bid1 {
+            return BoardOutcome::Seat0Won
+        }
+        if bid1 > bid0 {
+            return BoardOutcome::Seat1Won
+        }
+        prize -= 1
+    }
+    BoardOutcome::Draw
+}

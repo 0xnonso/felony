@@ -1,0 +1,4 @@
+[workspace]
+name = "felony"
+members = ["contracts", "tests/fixtures"]
+default-members = ["contracts", "tests/fixtures"]

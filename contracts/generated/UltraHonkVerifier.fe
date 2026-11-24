@@ -1,0 +1,2652 @@
+// Generated for Barretenberg 6.0.0 UltraHonk ZK/Keccak. Do not edit.
+// Compile with: fe build --standalone <file.fe> -O 2
+
+use std::abi::{Bytes, Bytes32, DynArray}
+use std::evm::{Address, Call, Create, Ctx}
+use std::evm::units::Wei
+use ingot::relations::RelationsLib
+use ingot::verification_key::VerificationKey
+use ingot::verifier::verify
+
+msg VerifierCalls {
+    #[selector = sol("verify(bytes,bytes32[])")]
+    Verify { proof: Bytes, public_inputs: DynArray<Bytes32> } -> bool,
+}
+
+/// One runtime for every circuit: the key is immutable contract data written by
+/// the constructor (read back with CODECOPY), never code-specializing constants.
+/// The constructor also deploys RelationsLib, keeping each contract small.
+pub contract UltraHonkVerifier uses (call: Call, ctx: Ctx) {
+    key: VerificationKey,
+    relations: Address,
+
+    init()
+    uses (mut key, mut relations, create: mut Create)
+    {
+        let circuit = ingot::circuit::verification_key()
+        assert!(circuit.is_supported())
+        key = circuit
+        relations = create.create<RelationsLib>(value: Wei::zero(), args: ())
+    }
+
+    recv VerifierCalls {
+        Verify { proof, public_inputs } -> bool uses (key, relations, call, ctx) {
+            verify(key, relations, proof, public_inputs)
+        }
+    }
+}
+
+pub mod accumulator {
+    // SPDX-License-Identifier: Apache-2.0
+    // Pinned utils.sol recursive accumulator reconstruction and aggregation.
+    use core::result::Result
+    use ingot::field::{Fq, Fr}
+    use ingot::curve::{CurveError, G1}
+    use ingot::types::EncodedG1
+    use ingot::transcript::hash_words
+    use std::evm::{Call, Ctx, revert_empty, revert_error}
+
+    /// The parser checks these limits too; keep this public helper safe in isolation.
+    pub fn decode_points(_ limbs: [Fr; 8]) -> (G1, G1) {
+        let (lhs, rhs) = encoded_points(limbs)
+        (checked_point(lhs), checked_point(rhs))
+    }
+
+    fn encoded_points(_ limbs: [Fr; 8]) -> (EncodedG1, EncodedG1) {
+        for i in 0 .. 8 {
+            let bits: u256 = if i % 2 == 0 { 136 } else { 120 }
+            if limbs[i].to_word() >= 1 << bits {
+                revert_error(ingot::errors::ValueGeLimbMax {})
+            }
+        }
+        (point(limbs[0], limbs[1], limbs[2], limbs[3]), point(limbs[4], limbs[5], limbs[6], limbs[7]))
+    }
+
+    pub fn aggregate(_ lhs: G1, _ rhs: G1, _ limbs: [Fr; 8]) -> Result<CurveError, (G1, G1)>
+    uses (call: Call, ctx: Ctx)
+    {
+        var is_default = true
+        for limb in limbs {
+            if limb != Fr::zero() {
+                is_default = false
+            }
+        }
+        if is_default {
+            return Result::Ok((lhs, rhs))
+        }
+        let (encoded_lhs, encoded_rhs) = encoded_points(limbs)
+        // Solidity checks all coordinates, then both identities, before curve calls.
+        if (encoded_lhs.x.to_word() | encoded_lhs.y.to_word()) == 0
+            || (encoded_rhs.x.to_word() | encoded_rhs.y.to_word()) == 0 {
+            revert_error(ingot::errors::PointAtInfinity {})
+        }
+        let other_lhs = checked_point(encoded_lhs)
+        let other_rhs = checked_point(encoded_rhs)
+        let separator = recursion_separator(other_lhs, other_rhs, lhs, rhs)
+        let lhs = match combine(lhs, other_lhs, separator) {
+            Result::Ok(value) => value,
+            Result::Err(error) => {
+                return Result::Err(error)
+            },
+        }
+        let rhs = match combine(rhs, other_rhs, separator) {
+            Result::Ok(value) => value,
+            Result::Err(error) => {
+                return Result::Err(error)
+            },
+        }
+        Result::Ok((lhs, rhs))
+    }
+
+    pub fn recursion_separator(_ other_lhs: G1, _ other_rhs: G1, _ lhs: G1, _ rhs: G1) -> Fr {
+        let a = other_lhs.to_encoded()
+        let b = other_rhs.to_encoded()
+        let c = lhs.to_encoded()
+        let d = rhs.to_encoded()
+        hash_words(
+            [
+                a.x.to_word(),
+                a.y.to_word(),
+                b.x.to_word(),
+                b.y.to_word(),
+                c.x.to_word(),
+                c.y.to_word(),
+                d.x.to_word(),
+                d.y.to_word(),
+            ],
+        )
+            .reduce_to_fr()
+    }
+
+    fn combine(_ base: G1, _ other: G1, _ separator: Fr) -> Result<CurveError, G1>
+    uses (call: Call, ctx: Ctx)
+    {
+        match base.mul(separator) {
+            Result::Ok(scaled) => scaled.add(other),
+            Result::Err(error) => Result::Err(error),
+        }
+    }
+
+    fn point(_ x_lo: Fr, _ x_hi: Fr, _ y_lo: Fr, _ y_hi: Fr) -> EncodedG1 {
+        let x = coordinate(x_lo.to_word() | (x_hi.to_word() << 136))
+        let y = coordinate(y_lo.to_word() | (y_hi.to_word() << 136))
+        EncodedG1 { x, y }
+    }
+
+    fn checked_point(_ encoded: EncodedG1) -> G1 {
+        match G1::from_encoded(encoded) {
+            Result::Ok(value) => value,
+            Result::Err(_) => revert_empty(),
+        }
+    }
+
+    fn coordinate(_ word: u256) -> Fq {
+        match Fq::from_word(word) {
+            Result::Ok(value) => value,
+            Result::Err(_) => revert_error(ingot::errors::ValueGeGroupOrder {}),
+        }
+    }
+}
+
+pub mod arrays {
+    use core::marker::{Copy, Clearable}
+    use core::ptr::MemArray
+
+    /// Runtime zero initialization avoids embedding large zero-filled constants in
+    /// contract bytecode. Clearable guarantees zero is a valid value of T.
+    pub(ingot) fn zero_array<T, const COUNT: usize>() -> [T; COUNT] where T: Copy + Clearable {
+        let allocation = MemArray<[T; COUNT]>::new_zeroed(1)
+        allocation[0]
+    }
+
+    /// One zero-initialized value in its own allocation. Large protocol state
+    /// (proof, transcript, MSM) is built in place and borrowed; returning it by
+    /// value would copy every word through the stack in the compiled code.
+    pub struct Buffer<T> { value: MemArray<T> }
+
+    impl<T> Buffer<T> where T: Clearable {
+        pub fn new() -> Self {
+            Self { value: MemArray<T>::new_zeroed(1) }
+        }
+    }
+
+    impl<T> Buffer<T> {
+        pub fn get(mut? self) -> mut? T {
+            mut? self.value[0]
+        }
+    }
+}
+
+pub mod circuit {
+    // Generated from bb 6.0.0 canonical VK JSON (N = 131072). Do not edit.
+    // Only the constructor reads this; the runtime verifier is circuit-independent.
+    use ingot::field::coordinate_constant
+    use ingot::types::EncodedG1
+    use ingot::verification_key::VerificationKey
+
+    pub fn verification_key() -> VerificationKey {
+        VerificationKey {
+            log_n: 17,
+            application_inputs: 17 - 8,
+            hash: 0x0a7d776a83056ecc24ac81e70eae1a91fb8c06958465990ccc199f1b4c4354ac,
+            commitments: [
+                // s1
+                EncodedG1 { x: coordinate_constant(0x0753be059396d2174f4c85539f770bb39e60a4be38f8cc9ff5a75a7894beccc0), y: coordinate_constant(0x1080b9268ae250e031db3fc1f6990c55a98300365d25c1297c3563fc1fb333b5) },
+                // s2
+                EncodedG1 { x: coordinate_constant(0x1405ff3f08e6f00c93d4237b3210563e99a630a9cb23053fe0e7093796970f68), y: coordinate_constant(0x2916e8bb6b908cddb7b4ea3a3f6c0ad9d14fbf930ab84a1924116d4d2036b9dc) },
+                // s3
+                EncodedG1 { x: coordinate_constant(0x0a1136992d91d7103ec63cec281ff6116eeddff1ebf327b34c042de0d40cf5dc), y: coordinate_constant(0x1a8c6c115e6b4f43f8ba6be8d6d2fde8836ecac91b107f5961491805612a645a) },
+                // s4
+                EncodedG1 { x: coordinate_constant(0x2b9aade240826e8d6f3053b4105dfe3de23c65861d6a0bbc97fbf971b77c34bf), y: coordinate_constant(0x1fe0e3875f84961f1979f91a5d596e31e06850501f4cfe4d52885dcc130f7d32) },
+                // id1
+                EncodedG1 { x: coordinate_constant(0x1793205c1f8aeb131aa979afc03234e3c6ac3e262f991fe0b89b63d5d9189b48), y: coordinate_constant(0x2375cb71c4403288f5106e0db9d07e86de3ac63d8105eed27cd9f8b16a9a566b) },
+                // id2
+                EncodedG1 { x: coordinate_constant(0x2cffaaebce11badb33b580d1337200c6bab2932e9d25d320bf687f9b32821fd9), y: coordinate_constant(0x2b40a00aec3643b7827115a983b78a42930ca9daf80bdf25e3aa78324632d2b7) },
+                // id3
+                EncodedG1 { x: coordinate_constant(0x16c2f72315a6c4542c5313837ff9bb9fd5f629a3ac7d819473cd360500942c2c), y: coordinate_constant(0x296b4af2c13222628f23328e266215ff5c63a602c236090addf538a4650038b2) },
+                // id4
+                EncodedG1 { x: coordinate_constant(0x2f28c3d802cc9629c6ad7f02e406bc0f6891e5a2d4010a6c95ca0327b69236c1), y: coordinate_constant(0x2b6d47582f4a0cdf617134d870eae789ebe1b569dca0541c559fc7a5f58f4e62) },
+                // lagrange_first
+                EncodedG1 { x: coordinate_constant(0x2a56ce41f6b0be13b9c26747621b821eee81b23a887f299049b14c11e98460d6), y: coordinate_constant(0x1aa98f2de3ddda547d8f6de4e725ded5827d6338c78656c0d12ca1aea6ef2c7c) },
+                // lagrange_last
+                EncodedG1 { x: coordinate_constant(0x085968afc7770e83bb9028fb340647192174a83be8a295371e1877467468c96f), y: coordinate_constant(0x16e0e0f9e5ee428b184a60196997f56c11b7958ce4e7a26e2925ce7935928edc) },
+                // q_lookup
+                EncodedG1 { x: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000), y: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000) },
+                // t1
+                EncodedG1 { x: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000), y: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000) },
+                // t2
+                EncodedG1 { x: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000), y: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000) },
+                // t3
+                EncodedG1 { x: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000), y: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000) },
+                // t4
+                EncodedG1 { x: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000), y: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000) },
+                // qm
+                EncodedG1 { x: coordinate_constant(0x14ed19b0b12ef7d1dbe30d553997a729858a3aa671435004008ee9a66a52c324), y: coordinate_constant(0x0849d85931374f80be4bf9c8943f406c0b2b6c54379c89885839715432ee11f5) },
+                // qr
+                EncodedG1 { x: coordinate_constant(0x10f8de76364bf5f157afbd41ed82c035371e0bf6515a1fcc12ae835588d5245c), y: coordinate_constant(0x2ffcfcb4cd0277a64afa06d00969be7bfb0ac2ec30711ee24248225487189a15) },
+                // qo
+                EncodedG1 { x: coordinate_constant(0x219bd2e4d2fd32575aedf329087cae9b21122e19e326e41ede1c7cdd8e48d831), y: coordinate_constant(0x2a0ef801daa2ff575e53e815b5d2fa4c387b504311c7baaa1ce3e01e69f26784) },
+                // qc
+                EncodedG1 { x: coordinate_constant(0x29ebec7906f6198233493532f6a80ae5a91dad077f7f3905cc379a9d64825490), y: coordinate_constant(0x2ed9089b85907dedfae55642477317938fd378e10d7b9b95907b9f75780b416a) },
+                // ql
+                EncodedG1 { x: coordinate_constant(0x10fe262d9f214ac6ff4d678e04a6318949d376860865c0e228794b1954e90a03), y: coordinate_constant(0x2115cf1048ca9230d30055cd03e8803ac822edc2a9e59a11e107c1e0b608d4b2) },
+                // q4
+                EncodedG1 { x: coordinate_constant(0x24b4c2229681c65a09c3bc2158edd641dad996c0a0c1718dfcd5866f94ae61e3), y: coordinate_constant(0x192658468c9316ff1e40d66be4b48694f06fa961c96edfb2ef0d9cc840f5236b) },
+                // q_arith
+                EncodedG1 { x: coordinate_constant(0x2a86c1c7074283b781ad6a729cd9f4540a9a9e473f159c45ec39e483540bfb6c), y: coordinate_constant(0x115798e2baf1bce0116dda543a7a09c285c62c961fcb2a38ad4de0038aa5ec9c) },
+                // q_range
+                EncodedG1 { x: coordinate_constant(0x16b884243600f6708482e8c5be265cb7bd8ed371cb6520cb36ed0cf8587be1bd), y: coordinate_constant(0x2acecc7fdaa1130770818be62b88030edf459cf2df7a6d60592958552e95b1eb) },
+                // q_elliptic
+                EncodedG1 { x: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000), y: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000) },
+                // q_memory
+                EncodedG1 { x: coordinate_constant(0x220664c71a225e444a175e2dd86e41caebbbfcb9347fff0a755fa0c0727c149d), y: coordinate_constant(0x030a5d21be74540c454f3bad4c786084ffa67939c451869257dafa82523fe7ff) },
+                // q_nnf
+                EncodedG1 { x: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000), y: coordinate_constant(0x0000000000000000000000000000000000000000000000000000000000000000) },
+                // q_poseidon_external
+                EncodedG1 { x: coordinate_constant(0x0e8d1ef0e9f61fbe9a9c7ed906b42521a6825b80b4ba35d54ab935dd17134c01), y: coordinate_constant(0x15ec32a4bf53558904c8411814d2d52ad472679252f4a4f377cf04123719b45d) },
+                // q_poseidon_internal
+                EncodedG1 { x: coordinate_constant(0x0977cbc3a1bbd0ece637c9e69a6f76654bed2be90e144dfd5507bdfcd454749f), y: coordinate_constant(0x0504c9d57916df7d9f04360235bc2474b27e297638178d8fd490c517e30d2d70) },
+            ],
+        }
+    }
+}
+
+pub mod commitments {
+    // SPDX-License-Identifier: Apache-2.0
+    // Port of pinned Aztec CommitmentScheme.sol and BaseZKHonkVerifier.verifyShplemini.
+    use ingot::arrays::Buffer
+    use ingot::field::{Fr, batch_invert, scalar_constant}
+    use ingot::proof::{ParsedProof, Transcript}
+    use ingot::types::{EncodedG1, MsmTerm}
+    use ingot::verification_key::{MAX_LOG_N, MSM_CAPACITY, VerificationKey}
+    use std::evm::{Call, Ctx}
+
+    /// z - r, z + r, r, z - g*r, z - 1, and two per fold after the first.
+    const OPENING_DENOMINATORS: usize = 2 * MAX_LOG_N + 3
+
+    /// r^(2^i) for each fold i < log_n.
+    pub fn squares(_ r: Fr, _ log_n: usize, _ powers: mut [Fr; MAX_LOG_N]) {
+        powers[0] = r
+        for i in 1 .. log_n {
+            powers[i] = powers[i - 1] * powers[i - 1]
+        }
+    }
+
+    /// Recover positive Gemini evaluations, working backwards through the folds.
+    pub fn fold_evaluations(
+        _ challenges: [Fr; MAX_LOG_N],
+        _ batched_evaluation: Fr,
+        _ negative_evaluations: [Fr; MAX_LOG_N],
+        _ powers: [Fr; MAX_LOG_N],
+        _ log_n: usize,
+        _ positive: mut [Fr; MAX_LOG_N],
+    )
+    uses (call: Call, ctx: Ctx)
+    {
+        var denominators = Buffer<[Fr; MAX_LOG_N]>::new()
+        let inverses = mut denominators.get()
+        for i in 0 .. log_n {
+            inverses[i] = powers[i] * (Fr::one() - challenges[i]) + challenges[i]
+        }
+        batch_invert(mut inverses, log_n)
+        var accumulator = batched_evaluation
+        var i = log_n
+        while i > 0 {
+            i -= 1
+            let power = powers[i]
+            let u = challenges[i]
+            let numerator = power * accumulator * scalar_constant(2) -
+                negative_evaluations[i] * (power * (Fr::one() - u) - u)
+            accumulator = numerator * inverses[i]
+            positive[i] = accumulator
+        }
+    }
+
+    /// Write the ordered MSM terms for the combined Shplonk/Gemini/Libra opening claim.
+    /// The first `42 + log_n` terms are used. Callers must also check Libra consistency.
+    pub fn opening_terms(
+        _ p: ParsedProof,
+        _ vk: VerificationKey,
+        _ t: Transcript,
+        _ terms: mut [MsmTerm; MSM_CAPACITY],
+    )
+    uses (call: Call, ctx: Ctx)
+    {
+        // Fold powers r^(2^i) and positive evaluations A_i(r^(2^i)).
+        var folds = Buffer<[[Fr; MAX_LOG_N]; 2]>::new()
+        let fold = mut folds.get()
+        squares(t.gemini_r, p.log_n, mut fold[0])
+        let powers = ref fold[0]
+        let generator = scalar_constant(
+            0x07b0c561a6148404f086204a9f36ffb0617942546750f230c893619174a57a76,
+        )
+        // Every Shplonk denominator, inverted together: z - r, z + r, r, z - g*r,
+        // z - 1, then z - r^(2^i), z + r^(2^i) for each later fold i.
+        var denominators = Buffer<[Fr; OPENING_DENOMINATORS]>::new()
+        let inverses = mut denominators.get()
+        inverses[0] = t.shplonk_z - powers[0]
+        inverses[1] = t.shplonk_z + powers[0]
+        inverses[2] = t.gemini_r
+        inverses[3] = t.shplonk_z - generator * t.gemini_r
+        inverses[4] = t.shplonk_z - Fr::one()
+        for i in 1 .. p.log_n {
+            inverses[3 + 2 * i] = t.shplonk_z - powers[i]
+            inverses[4 + 2 * i] = t.shplonk_z + powers[i]
+        }
+        batch_invert(mut inverses, 3 + 2 * p.log_n)
+        let positive_inverse = inverses[0]
+        let negative_inverse = inverses[1]
+        let unshifted = -(positive_inverse + t.shplonk_nu * negative_inverse)
+        let shifted = -(inverses[2] * (positive_inverse - t.shplonk_nu * negative_inverse))
+        terms[0] = MsmTerm { point: p.shplonk_q, scalar: Fr::one() }
+        terms[1].point = p.gemini_masking_poly
+        for i in 0 .. 28 {
+            terms[i + 2].point = vk.commitments[i]
+        }
+        let witness = [
+            p.w1,
+            p.w2,
+            p.w3,
+            p.w4,
+            p.z_perm,
+            p.lookup_inverses,
+            p.lookup_read_counts,
+            p.lookup_read_tags,
+        ]
+        for i in 0 .. 8 {
+            terms[i + 30].point = witness[i]
+        }
+        var rho_power = Fr::one()
+        var batched_evaluation = Fr::zero()
+        for i in 0 .. 37 {
+            terms[i + 1].scalar = unshifted * rho_power
+            batched_evaluation = batched_evaluation + p.evaluations[i] * rho_power
+            rho_power = rho_power * t.rho
+        }
+        for i in 0 .. 5 {
+            terms[i + 30].scalar = terms[i + 30].scalar + shifted * rho_power
+            batched_evaluation = batched_evaluation + p.evaluations[i + 37] * rho_power
+            rho_power = rho_power * t.rho
+        }
+        fold_evaluations(
+            t.sumcheck_challenges,
+            batched_evaluation,
+            p.gemini_a_evaluations,
+            powers,
+            p.log_n,
+            mut fold[1],
+        )
+        let positive = ref fold[1]
+        var constant_term = positive[0] * positive_inverse
+            + p.gemini_a_evaluations[0] * t.shplonk_nu * negative_inverse
+        var nu_power = t.shplonk_nu * t.shplonk_nu
+        for i in 0 .. p.log_n - 1 {
+            let positive_scale = nu_power * inverses[5 + 2 * i]
+            let negative_scale = nu_power * t.shplonk_nu * inverses[6 + 2 * i]
+            terms[38 + i] = MsmTerm {
+                point: p.gemini_fold_comms[i],
+                scalar: -positive_scale - negative_scale,
+            }
+            constant_term = constant_term
+                + positive_scale * positive[i + 1]
+                + negative_scale * p.gemini_a_evaluations[i + 1]
+            nu_power = nu_power * t.shplonk_nu * t.shplonk_nu
+        }
+        // Five Libra claims: r, g*r, r, 1, r. Boundary claim at 1 has value zero.
+        let libra_inverses = [
+            positive_inverse,
+            inverses[3],
+            positive_inverse,
+            inverses[4],
+            positive_inverse,
+        ]
+        var scales = ingot::arrays::zero_array<Fr, 5>()
+        for i in 0 .. 5 {
+            let scale = libra_inverses[i] * nu_power
+            scales[i] = -scale
+            nu_power = nu_power * t.shplonk_nu
+            if i != 3 {
+                let index = if i < 3 { i } else { i - 1 }
+                constant_term = constant_term + scale * p.libra_poly_evals[index]
+            }
+        }
+        let boundary: usize = 37 + p.log_n
+        terms[boundary] = MsmTerm { point: p.libra_commitments[0], scalar: scales[0] }
+        terms[boundary + 1] = MsmTerm {
+            point: p.libra_commitments[1],
+            scalar: scales[1] + scales[2] + scales[3],
+        }
+        terms[boundary + 2] = MsmTerm { point: p.libra_commitments[2], scalar: scales[4] }
+        terms[boundary + 3] = MsmTerm { point: EncodedG1::generator(), scalar: constant_term }
+        terms[boundary + 4] = MsmTerm { point: p.kzg_quotient, scalar: t.shplonk_z }
+    }
+}
+
+pub mod curve {
+    use core::ops::Eq
+    use core::result::Result
+    use std::evm::{Address, Call, Ctx}
+    use std::evm::crypto::{BN254_ADD_ADDRESS, BN254_MUL_ADDRESS, BN254_PAIRING_ADDRESS, addmod, mulmod}
+    use ingot::field::{FQ_MODULUS, Fq, Fr}
+    use ingot::types::{EncodedG1, EncodedG2}
+    use core::abi::{load_word, store_word}
+    use core::ptr::{self, FixedMemBuffer, MemSpan}
+
+    pub enum CurveError {
+        InvalidPoint,
+        AddCallFailed,
+        MulCallFailed,
+        PairingCallFailed,
+        InvalidPairingResult,
+    }
+
+    impl Copy for CurveError {}
+
+    /// Canonical BN254 G1 point, including the EVM identity encoding (0,0).
+    /// Private coordinates can only be obtained by validation or invariant-preserving operations.
+    pub struct G1 { x: Fq, y: Fq }
+
+    impl Copy for G1 {}
+
+    /// One pairing term: checked G1 and canonically encoded, not yet checked G2.
+    pub struct PairingTerm { pub g1: G1, pub g2: EncodedG2 }
+
+    impl Copy for PairingTerm {}
+
+    /// Check e(first.g1, first.g2) * e(second.g1, second.g2) == 1.
+    /// Two terms match the pinned verifier. This does not construct its equation
+    /// or supply the fixed SRS points; those belong to the final pairing stage.
+    pub fn pairing_check(_ first: PairingTerm, _ second: PairingTerm) -> Result<CurveError, bool>
+    uses (call: Call, ctx: Ctx)
+    {
+        let input = FixedMemBuffer<384>::alloc()
+        unsafe {
+            write_pair(input.ptr(), first)
+            write_pair(ptr::offset_bytes(input.ptr(), 192), second)
+        }
+        var output = FixedMemBuffer<32>::alloc().into_buffer()
+        let outcome = call
+            .raw_staticcall(
+                addr: Address::new(BN254_PAIRING_ADDRESS),
+                gas: ctx.gas(),
+                args: input.span(),
+                ret: mut output,
+            )
+        if !outcome.success() {
+            return Result::Err(CurveError::PairingCallFailed)
+        }
+        // Trust the known precompile's fixed output size. Match Solidity's strict
+        // bool decoding, keeping a successful false distinct from call failure.
+        match unsafe {
+            load_word(output.ptr())
+        } {
+            0 => Result::Ok(false),
+            1 => Result::Ok(true),
+            _ => Result::Err(CurveError::InvalidPairingResult),
+        }
+    }
+
+    /// destination must point to at least 192 writable bytes.
+    #[inline(always)]
+    unsafe fn write_pair(_ destination: *u8, _ term: PairingTerm) {
+        store_word(ptr: destination, value: term.g1.x.to_word())
+        store_word(
+            ptr: ptr::offset_bytes(destination, 32),
+            value: term.g1.y.to_word(),
+        )
+        store_word(
+            ptr: ptr::offset_bytes(destination, 64),
+            value: term.g2.x.imag.to_word(),
+        )
+        store_word(
+            ptr: ptr::offset_bytes(destination, 96),
+            value: term.g2.x.real.to_word(),
+        )
+        store_word(
+            ptr: ptr::offset_bytes(destination, 128),
+            value: term.g2.y.imag.to_word(),
+        )
+        store_word(
+            ptr: ptr::offset_bytes(destination, 160),
+            value: term.g2.y.real.to_word(),
+        )
+    }
+
+    impl G1 {
+        /// Private trusted-output decoder. output must point to 64 initialized bytes
+        /// encoding a canonical curve point or identity, as guaranteed by a
+        /// successful BN254 addition/multiplication precompile.
+        #[inline(always)]
+        unsafe fn from_precompile_output(_ output: *u8) -> Self {
+            Self {
+                x: Fq::from_canonical_word_unchecked(load_word(output)),
+                y: Fq::from_canonical_word_unchecked(load_word(ptr::offset_bytes(output, 32))),
+            }
+        }
+
+        /// Establish curve membership without an external call. EncodedG1 already
+        /// guarantees canonical coordinates; (0,0) is the distinguished identity.
+        pub fn from_encoded(_ point: EncodedG1) -> Result<CurveError, Self> {
+            let x = point.x.to_word()
+            let y = point.y.to_word()
+            if x == 0 && y == 0 {
+                return Result::Ok(Self { x: point.x, y: point.y })
+            }
+            let x_squared = mulmod(x, x, FQ_MODULUS)
+            let rhs = addmod(mulmod(x_squared, x, FQ_MODULUS), 3, FQ_MODULUS)
+            if mulmod(y, y, FQ_MODULUS) != rhs {
+                return Result::Err(CurveError::InvalidPoint)
+            }
+            Result::Ok(Self { x: point.x, y: point.y })
+        }
+
+        pub fn to_encoded(self) -> EncodedG1 {
+            EncodedG1 { x: self.x, y: self.y }
+        }
+
+        pub fn is_identity(self) -> bool {
+            self.x.to_word() == 0 && self.y.to_word() == 0
+        }
+
+        pub fn negate(self) -> Self {
+            Self { x: self.x, y: self.y.negate() }
+        }
+
+        pub fn add(self, _ other: Self) -> Result<CurveError, Self>
+        uses (call: Call, ctx: Ctx)
+        {
+            let input = FixedMemBuffer<128>::alloc()
+            unsafe {
+                store_word(ptr: input.ptr(), value: self.x.to_word())
+                store_word(
+                    ptr: ptr::offset_bytes(input.ptr(), 32),
+                    value: self.y.to_word(),
+                )
+                store_word(
+                    ptr: ptr::offset_bytes(input.ptr(), 64),
+                    value: other.x.to_word(),
+                )
+                store_word(
+                    ptr: ptr::offset_bytes(input.ptr(), 96),
+                    value: other.y.to_word(),
+                )
+            }
+            call_point(BN254_ADD_ADDRESS, input.span())
+        }
+
+        /// Fr deliberately limits callers to canonical protocol scalars, although
+        /// the raw EVM precompile accepts arbitrary u256 scalars.
+        pub fn mul(self, _ scalar: Fr) -> Result<CurveError, Self>
+        uses (call: Call, ctx: Ctx)
+        {
+            let input = FixedMemBuffer<96>::alloc()
+            unsafe {
+                store_word(ptr: input.ptr(), value: self.x.to_word())
+                store_word(
+                    ptr: ptr::offset_bytes(input.ptr(), 32),
+                    value: self.y.to_word(),
+                )
+                store_word(
+                    ptr: ptr::offset_bytes(input.ptr(), 64),
+                    value: scalar.to_word(),
+                )
+            }
+            call_point(BN254_MUL_ADDRESS, input.span())
+        }
+    }
+
+    impl Eq for G1 {
+        fn eq(self, _ other: Self) -> bool {
+            self.x.to_word() == other.x.to_word() && self.y.to_word() == other.y.to_word()
+        }
+    }
+
+    // Private to curve operations: each caller fixes its address and input layout.
+    fn call_point(_ address: u256, _ input: MemSpan) -> Result<CurveError, G1>
+    uses (call: Call, ctx: Ctx)
+    {
+        var output = FixedMemBuffer<64>::alloc().into_buffer()
+        let outcome = call
+            .raw_staticcall(
+                addr: Address::new(address),
+                gas: ctx.gas(),
+                args: input,
+                ret: mut output,
+            )
+        if !outcome.success() {
+            return Result::Err(
+                if address == BN254_ADD_ADDRESS {
+                    CurveError::AddCallFailed
+                } else {
+                    CurveError::MulCallFailed
+                },
+            )
+        }
+        // Success at these fixed precompile addresses guarantees a canonical G1.
+        Result::Ok(unsafe { G1::from_precompile_output(output.ptr()) })
+    }
+
+    use ingot::types::MsmTerm
+
+    /// Every term is validated even when its scalar is zero, as in the reference.
+    /// Terms that cannot change the sum skip the multiplication and addition.
+    /// Sum of the first `len` terms; capacity is fixed, the count is runtime data.
+    pub fn msm<const CAPACITY: usize>(_ terms: [MsmTerm; CAPACITY], _ len: usize) -> Result<
+        CurveError,
+        G1,
+    >
+    uses (call: Call, ctx: Ctx)
+    {
+        var accumulator = G1 {
+            x: ingot::field::coordinate_constant(0),
+            y: ingot::field::coordinate_constant(0),
+        }
+        for i in 0 .. len {
+            let term = terms[i]
+            let point = match G1::from_encoded(term.point) {
+                Result::Ok(value) => value,
+                Result::Err(error) => {
+                    return Result::Err(error)
+                },
+            }
+            // Identity point or zero scalar adds nothing: skip two precompile calls.
+            if (term.point.x.to_word() | term.point.y.to_word()) == 0 || term.scalar == Fr::zero() {
+                continue
+            }
+            let scaled = match point.mul(term.scalar) {
+                Result::Ok(value) => value,
+                Result::Err(error) => {
+                    return Result::Err(error)
+                },
+            }
+            accumulator = match accumulator.add(scaled) {
+                Result::Ok(value) => value,
+                Result::Err(error) => {
+                    return Result::Err(error)
+                },
+            }
+        }
+        Result::Ok(accumulator)
+    }
+}
+
+pub mod encoding {
+    use core::result::Result
+    use std::abi::Bytes
+    use ingot::field::{Fq, Fr}
+    use ingot::types::EncodedG1
+
+    pub enum ProofReadError {
+        UnexpectedEnd,
+        NonCanonicalScalar,
+        NonCanonicalCoordinate,
+        TrailingBytes,
+    }
+
+    impl Copy for ProofReadError {}
+
+    /// Owns the payload. Private cursor is always <= bytes.len().
+    /// Every failed operation leaves the cursor unchanged, including a whole G1 read.
+    pub struct ProofReader { bytes: Bytes, cursor: u256 }
+
+    impl ProofReader {
+        pub fn new(_ bytes: own Bytes) -> Self {
+            Self { bytes, cursor: 0 }
+        }
+
+        pub fn position(self) -> u256 {
+            self.cursor
+        }
+
+        pub fn remaining(self) -> u256 {
+            self.bytes.len() as u256 - self.cursor
+        }
+
+        /// Useful for bounded section traversal; this does not validate skipped data.
+        pub fn skip(mut self, _ width: u256) -> Result<ProofReadError, ()> {
+            if width > self.remaining() {
+                return Result::Err(ProofReadError::UnexpectedEnd)
+            }
+            self.cursor += width
+            Result::Ok(())
+        }
+
+        /// Unrestricted big-endian word. No field reduction or range check.
+        pub fn read_word(mut self) -> Result<ProofReadError, u256> {
+            if self.remaining() < 32 {
+                return Result::Err(ProofReadError::UnexpectedEnd)
+            }
+            let word = self.word_here()
+            self.cursor += 32
+            Result::Ok(word)
+        }
+
+        pub fn read_fr(mut self) -> Result<ProofReadError, Fr> {
+            if self.remaining() < 32 {
+                return Result::Err(ProofReadError::UnexpectedEnd)
+            }
+            match Fr::from_word(self.word_here()) {
+                Result::Ok(value) => {
+                    self.cursor += 32
+                    Result::Ok(value)
+                },
+                Result::Err(_) => Result::Err(ProofReadError::NonCanonicalScalar),
+            }
+        }
+
+        pub fn read_fq(mut self) -> Result<ProofReadError, Fq> {
+            if self.remaining() < 32 {
+                return Result::Err(ProofReadError::UnexpectedEnd)
+            }
+            match Fq::from_word(self.word_here()) {
+                Result::Ok(value) => {
+                    self.cursor += 32
+                    Result::Ok(value)
+                },
+                Result::Err(_) => Result::Err(ProofReadError::NonCanonicalCoordinate),
+            }
+        }
+
+        /// Two canonical coordinates; curve membership is a later boundary.
+        /// In particular, the identity encoding (0,0) remains allowed.
+        pub fn read_g1(mut self) -> Result<ProofReadError, EncodedG1> {
+            if self.remaining() < 64 {
+                return Result::Err(ProofReadError::UnexpectedEnd)
+            }
+            let x = match Fq::from_word(self.word_here()) {
+                Result::Ok(value) => value,
+                Result::Err(_) => {
+                    return Result::Err(ProofReadError::NonCanonicalCoordinate)
+                },
+            }
+            // The 64-byte check proves this offset fits usize and contains a full word.
+            let y_word = self.bytes.word_at((self.cursor + 32).downcast_unchecked())
+            let y = match Fq::from_word(y_word) {
+                Result::Ok(value) => value,
+                Result::Err(_) => {
+                    return Result::Err(ProofReadError::NonCanonicalCoordinate)
+                },
+            }
+            self.cursor += 64
+            Result::Ok(EncodedG1 { x, y })
+        }
+
+        /// Call after the protocol's complete inventory has been read.
+        pub fn finish(self) -> Result<ProofReadError, ()> {
+            if self.remaining() == 0 {
+                Result::Ok(())
+            } else {
+                Result::Err(ProofReadError::TrailingBytes)
+            }
+        }
+
+        // Only called after checking at least 32 bytes remain. This also proves the
+        // u256 cursor fits usize. Bytes.word_at would otherwise zero-pad a short word.
+        fn word_here(self) -> u256 {
+            self.bytes.word_at(self.cursor.downcast_unchecked())
+        }
+    }
+
+    use ingot::proof::ProofBuffer
+    use std::evm::revert_error
+    use ingot::errors::{
+        ValueGeLimbMax,
+        ValueGeFieldOrder,
+        ValueGeGroupOrder,
+        ProofLengthWrong,
+        ProofLengthWrongWithLogN,
+    }
+
+    /// Bytes in an UltraKeccakZKFlavor proof for a circuit of 2^log_n rows.
+    pub fn proof_bytes(_ log_n: usize) -> usize {
+        32 * (82 + 12 * log_n)
+    }
+
+    /// Decode the entire payload for a circuit of 2^log_n rows. Invalid encodings
+    /// revert, as in Solidity loadProof. This establishes representation, not validity.
+    #[inline(never)]
+    pub fn decode_proof(_ bytes: own Bytes, _ log_n: usize) -> ProofBuffer {
+        let expected = proof_bytes(log_n)
+        if bytes.len() != expected {
+            revert_error(
+                ProofLengthWrongWithLogN {
+                    logN: log_n as u256,
+                    actualLength: bytes.len() as u256,
+                    expectedLength: expected as u256,
+                },
+            )
+        }
+        var reader = ProofReader::new(bytes)
+        var decoded = ProofBuffer::new()
+        let p = mut decoded.get()
+        p.log_n = log_n
+        for i in 0 .. 8 {
+            let word = match reader.read_word() {
+                Result::Ok(value) => value,
+                Result::Err(_) => revert_error(ProofLengthWrong {}),
+            }
+            let bits: u256 = if i % 2 == 0 { 136 } else { 120 }
+            if word >= 1 << bits {
+                revert_error(ValueGeLimbMax {})
+            }
+            p.accumulator[i] = ingot::field::scalar_constant(word)
+        }
+        p.gemini_masking_poly = point(mut reader)
+        p.w1 = point(mut reader)
+        p.w2 = point(mut reader)
+        p.w3 = point(mut reader)
+        p.lookup_read_counts = point(mut reader)
+        p.lookup_read_tags = point(mut reader)
+        p.w4 = point(mut reader)
+        p.lookup_inverses = point(mut reader)
+        p.z_perm = point(mut reader)
+        p.libra_commitments[0] = point(mut reader)
+        p.libra_sum = scalar(mut reader)
+        for i in 0 .. log_n {
+            for j in 0 .. 9 {
+                p.sumcheck_univariates[i][j] = scalar(mut reader)
+            }
+        }
+        for i in 0 .. 42 {
+            p.evaluations[i] = scalar(mut reader)
+        }
+        p.libra_evaluation = scalar(mut reader)
+        p.libra_commitments[1] = point(mut reader)
+        p.libra_commitments[2] = point(mut reader)
+        for i in 0 .. log_n - 1 {
+            p.gemini_fold_comms[i] = point(mut reader)
+        }
+        for i in 0 .. log_n {
+            p.gemini_a_evaluations[i] = scalar(mut reader)
+        }
+        for i in 0 .. 4 {
+            p.libra_poly_evals[i] = scalar(mut reader)
+        }
+        p.shplonk_q = point(mut reader)
+        p.kzg_quotient = point(mut reader)
+        if reader.finish().is_err() {
+            revert_error(ProofLengthWrong {})
+        }
+        decoded
+    }
+
+    fn scalar(_ reader: mut ProofReader) -> Fr {
+        match reader.read_fr() {
+            Result::Ok(value) => value,
+            Result::Err(ProofReadError::NonCanonicalScalar) => revert_error(ValueGeFieldOrder {}),
+            Result::Err(_) => revert_error(ProofLengthWrong {}),
+        }
+    }
+
+    fn point(_ reader: mut ProofReader) -> EncodedG1 {
+        match reader.read_g1() {
+            Result::Ok(value) => value,
+            Result::Err(ProofReadError::NonCanonicalCoordinate) => revert_error(ValueGeGroupOrder {}),
+            Result::Err(_) => revert_error(ProofLengthWrong {}),
+        }
+    }
+}
+
+pub mod entities {
+    // Pinned HonkTypes.WIRE indices. ZK proof evaluations add a masking slot at 0.
+    pub const SIGMA_1: usize = 0
+    pub const SIGMA_2: usize = 1
+    pub const SIGMA_3: usize = 2
+    pub const SIGMA_4: usize = 3
+    pub const ID_1: usize = 4
+    pub const ID_2: usize = 5
+    pub const ID_3: usize = 6
+    pub const ID_4: usize = 7
+    pub const LAGRANGE_FIRST: usize = 8
+    pub const LAGRANGE_LAST: usize = 9
+    pub const Q_LOOKUP: usize = 10
+    pub const TABLE_1: usize = 11
+    pub const TABLE_2: usize = 12
+    pub const TABLE_3: usize = 13
+    pub const TABLE_4: usize = 14
+    pub const Q_M: usize = 15
+    pub const Q_R: usize = 16
+    pub const Q_O: usize = 17
+    pub const Q_C: usize = 18
+    pub const Q_L: usize = 19
+    pub const Q_4: usize = 20
+    pub const Q_ARITH: usize = 21
+    pub const Q_RANGE: usize = 22
+    pub const Q_ELLIPTIC: usize = 23
+    pub const Q_MEMORY: usize = 24
+    pub const Q_NNF: usize = 25
+    pub const Q_POSEIDON2_EXTERNAL: usize = 26
+    pub const Q_POSEIDON2_INTERNAL: usize = 27
+    pub const W_L: usize = 28
+    pub const W_R: usize = 29
+    pub const W_O: usize = 30
+    pub const W_4: usize = 31
+    pub const Z_PERM: usize = 32
+    pub const LOOKUP_INVERSES: usize = 33
+    pub const LOOKUP_READ_COUNTS: usize = 34
+    pub const LOOKUP_READ_TAGS: usize = 35
+    pub const W_L_SHIFT: usize = 36
+    pub const W_R_SHIFT: usize = 37
+    pub const W_O_SHIFT: usize = 38
+    pub const W_4_SHIFT: usize = 39
+    pub const Z_PERM_SHIFT: usize = 40
+
+    pub const NUMBER_OF_ENTITIES: usize = 41
+    pub const NUMBER_OF_ENTITIES_ZK: usize = 42
+    pub const NUMBER_OF_ALPHAS: usize = 30
+    pub const NUMBER_OF_SUBRELATIONS: usize = 31
+    pub const NUMBER_UNSHIFTED_ZK: usize = 37
+}
+
+pub mod errors {
+    // Solidity-compatible errors from the pinned Barretenberg Errors library.
+    use std::evm::revert_error
+    use ingot::field::FieldArithmeticError
+
+    #[error]
+    pub struct ValueGeLimbMax {}
+    #[error]
+    pub struct ValueGeGroupOrder {}
+    #[error]
+    pub struct ValueGeFieldOrder {}
+    #[error]
+    pub struct InvertOfZero {}
+    #[error]
+    pub struct NotPowerOfTwo {}
+    #[error]
+    pub struct ProofLengthWrong {}
+    #[error]
+    pub struct ProofLengthWrongWithLogN {
+        pub logN: u256,
+        pub actualLength: u256,
+        pub expectedLength: u256,
+    }
+    #[error]
+    pub struct PublicInputsLengthWrong {}
+    #[error]
+    pub struct SumcheckFailed {}
+    #[error]
+    pub struct ShpleminiFailed {}
+    #[error]
+    pub struct PointAtInfinity {}
+    #[error]
+    pub struct ConsistencyCheckFailed {}
+    #[error]
+    pub struct GeminiChallengeInSubgroup {}
+
+    /// Keep arithmetic failures distinct when crossing the verifier boundary.
+    pub(ingot) fn arithmetic(_ error: FieldArithmeticError) -> ! {
+        match error {
+            FieldArithmeticError::ZeroInverse => revert_error(InvertOfZero {}),
+            FieldArithmeticError::UnsupportedExponent => revert_error(NotPowerOfTwo {}),
+            FieldArithmeticError::ModexpCallFailed => {
+                // Fr.sol returns this literal, not keccak("ModExpFailed()")[0:4].
+                let data = std::abi::bytes_from_words_prefix<4, 1>([0xf8d61709 << 224])
+                std::evm::revert_bytes(data.span())
+            },
+            // Impossible for the real precompile; preserve canonical Fr under mocks.
+            FieldArithmeticError::NonCanonicalModexpResult => revert_error(ValueGeFieldOrder {}),
+        }
+    }
+}
+
+pub mod field {
+    use core::result::Result
+    use core::ops::{Add, Eq, Mul, Neg, Sub}
+    use std::evm::crypto::{MODEXP_ADDRESS, addmod, mulmod}
+    use std::evm::{Address, Call, Ctx}
+    use core::abi::{load_word, store_word}
+    use core::ptr::{self, FixedMemBuffer}
+
+    /// Order of the BN254 scalar field: used for constraint and proof arithmetic.
+    pub const FR_MODULUS: u256 = 21888242871839275222246405745257275088548364400416034343698204186575808495617
+
+    /// Modulus of the BN254 base field: used for curve coordinates.
+    pub const FQ_MODULUS: u256 = 21888242871839275222246405745257275088696311157297823662689037894645226208583
+
+    pub enum FieldDecodeError {
+        NonCanonicalScalar,
+        NonCanonicalCoordinate,
+    }
+
+    impl Copy for FieldDecodeError {}
+
+    pub enum FieldArithmeticError {
+        ZeroInverse,
+        UnsupportedExponent,
+        ModexpCallFailed,
+        NonCanonicalModexpResult,
+    }
+
+    impl Copy for FieldArithmeticError {}
+
+    /// Canonical scalar. The private representation must remain below FR_MODULUS.
+    pub struct Fr { value: u256 }
+
+    impl Copy for Fr {}
+
+    /// Checked construction for protocol constants and bounded small loop indices.
+    /// Proof words use from_word so their failure remains explicit at the boundary.
+    #[inline(always)]
+    pub(ingot) fn scalar_constant(_ word: u256) -> Fr {
+        if word >= FR_MODULUS {
+            core::panic()
+        }
+        Fr { value: word }
+    }
+
+    impl Fr {
+        pub const fn zero() -> Self {
+            Self { value: 0 }
+        }
+
+        pub const fn one() -> Self {
+            Self { value: 1 }
+        }
+
+        /// Use for external proof words. Never silently reduce malformed encodings.
+        pub fn from_word(_ word: u256) -> Result<FieldDecodeError, Self> {
+            if word >= FR_MODULUS {
+                Result::Err(FieldDecodeError::NonCanonicalScalar)
+            } else {
+                Result::Ok(Self { value: word })
+            }
+        }
+
+        /// Use only where the protocol explicitly reduces a hash modulo Fr.
+        pub fn from_hash_word(_ word: u256) -> Self {
+            Self { value: word % FR_MODULUS }
+        }
+
+        pub fn to_word(self) -> u256 {
+            self.value
+        }
+
+        /// Match the pinned Solidity pow helper: only positive powers of two.
+        pub fn pow(self, _ exponent: u256) -> Result<FieldArithmeticError, Self>
+        uses (call: Call, ctx: Ctx)
+        {
+            if exponent == 0 {
+                return Result::Err(FieldArithmeticError::UnsupportedExponent)
+            }
+            if (exponent & (exponent - 1)) != 0 {
+                return Result::Err(FieldArithmeticError::UnsupportedExponent)
+            }
+            self.modexp(exponent)
+        }
+
+        /// Fermat inversion: for nonzero a, a^(r-2) is its multiplicative inverse.
+        pub fn invert(self) -> Result<FieldArithmeticError, Self>
+        uses (call: Call, ctx: Ctx)
+        {
+            if self.value == 0 {
+                return Result::Err(FieldArithmeticError::ZeroInverse)
+            }
+            self.modexp(FR_MODULUS - 2)
+        }
+
+        /// Division can fail, so keep it explicit rather than overloading `/`.
+        pub fn divide(self, _ denominator: Self) -> Result<FieldArithmeticError, Self>
+        uses (call: Call, ctx: Ctx)
+        {
+            match denominator.invert() {
+                Result::Ok(inverse) => Result::Ok(self * inverse),
+                Result::Err(error) => Result::Err(error),
+            }
+        }
+
+        // Fixed MODEXP input: three 32-byte lengths, then base, exponent, modulus.
+        // Kept private so the public pow policy cannot be bypassed accidentally.
+        fn modexp(self, _ exponent: u256) -> Result<FieldArithmeticError, Self>
+        uses (call: Call, ctx: Ctx)
+        {
+            let input = FixedMemBuffer<192>::alloc()
+            unsafe {
+                store_word(ptr: input.ptr(), value: 32)
+                store_word(ptr: ptr::offset_bytes(input.ptr(), 32), value: 32)
+                store_word(ptr: ptr::offset_bytes(input.ptr(), 64), value: 32)
+                store_word(ptr: ptr::offset_bytes(input.ptr(), 96), value: self.value)
+                store_word(ptr: ptr::offset_bytes(input.ptr(), 128), value: exponent)
+                store_word(
+                    ptr: ptr::offset_bytes(input.ptr(), 160),
+                    value: FR_MODULUS,
+                )
+            }
+            var output = FixedMemBuffer<32>::alloc().into_buffer()
+            let outcome = call
+                .raw_staticcall(
+                    addr: Address::new(MODEXP_ADDRESS),
+                    gas: ctx.gas(),
+                    args: input.span(),
+                    ret: mut output,
+                )
+            if !outcome.success() {
+                return Result::Err(FieldArithmeticError::ModexpCallFailed)
+            }
+            // Trust the known precompile's fixed output size, as Fe stdlib does.
+            // The whole allocation was initialized, even if a mock returns less.
+            let word = unsafe {
+                load_word(output.ptr())
+            }
+            match Self::from_word(word) {
+                Result::Ok(value) => Result::Ok(value),
+                Result::Err(_) => Result::Err(FieldArithmeticError::NonCanonicalModexpResult),
+            }
+        }
+    }
+
+    // The operator traits keep arithmetic typed: Fr + Fq is not defined.
+    // addmod/mulmod reduce the full intermediate, without u256 truncation.
+    impl Add for Fr {
+        fn add(own self, _ other: own Self) -> Self {
+            Self { value: addmod(self.value, other.value, FR_MODULUS) }
+        }
+    }
+
+    impl Sub for Fr {
+        fn sub(own self, _ other: own Self) -> Self {
+            // other < r, so r - other is safe, including other == 0.
+            Self { value: addmod(self.value, FR_MODULUS - other.value, FR_MODULUS) }
+        }
+    }
+
+    impl Mul for Fr {
+        fn mul(own self, _ other: own Self) -> Self {
+            Self { value: mulmod(self.value, other.value, FR_MODULUS) }
+        }
+    }
+
+    impl Neg for Fr {
+        fn neg(own self) -> Self {
+            // r represents zero mathematically, but is not a canonical Fr word.
+            if self.value == 0 {
+                Self::zero()
+            } else {
+                Self { value: FR_MODULUS - self.value }
+            }
+        }
+    }
+
+    impl Eq for Fr {
+        fn eq(self, _ other: Self) -> bool {
+            self.value == other.value
+        }
+    }
+
+    /// Canonical coordinate. This does not establish curve membership.
+    pub struct Fq { value: u256 }
+
+    impl Copy for Fq {}
+
+    impl Fq {
+        /// Internal trust boundary: caller must establish word < FQ_MODULUS.
+        /// Successful BN254 precompile output supplies this guarantee. Untrusted
+        /// proof words must use from_word instead.
+        #[inline(always)]
+        pub(ingot) unsafe fn from_canonical_word_unchecked(_ word: u256) -> Self {
+            Self { value: word }
+        }
+
+        /// Coordinate-field negation preserves the canonical zero encoding.
+        pub fn negate(self) -> Self {
+            if self.value == 0 {
+                self
+            } else {
+                Self { value: FQ_MODULUS - self.value }
+            }
+        }
+
+        pub fn from_word(_ word: u256) -> Result<FieldDecodeError, Self> {
+            if word >= FQ_MODULUS {
+                Result::Err(FieldDecodeError::NonCanonicalCoordinate)
+            } else {
+                Result::Ok(Self { value: word })
+            }
+        }
+
+        pub fn to_word(self) -> u256 {
+            self.value
+        }
+    }
+
+    /// Checked coordinate construction for fixed protocol/VK constants.
+    #[inline(always)]
+    pub(ingot) fn coordinate_constant(_ word: u256) -> Fq {
+        match Fq::from_word(word) {
+            Result::Ok(value) => value,
+            Result::Err(_) => core::panic(),
+        }
+    }
+
+    /// Protocol stages abort on an invalid denominator, matching the reference.
+    /// The public Fr.invert API still exposes the recoverable typed error.
+    pub(ingot) fn inverse(_ value: Fr) -> Fr uses (call: Call, ctx: Ctx) {
+        match value.invert() {
+            Result::Ok(result) => result,
+            Result::Err(error) => ingot::errors::arithmetic(error),
+        }
+    }
+
+    /// A scalar kept as numerator / denominator. Sums of quotients then need no
+    /// MODEXP inversion (~1.5k gas each) until the value itself is required.
+    /// Callers must establish a nonzero denominator before comparing or evaluating.
+    pub struct Fraction { pub numerator: Fr, pub denominator: Fr }
+
+    impl Copy for Fraction {}
+
+    impl Fraction {
+        pub fn from(_ value: Fr) -> Self {
+            Self { numerator: value, denominator: Fr::one() }
+        }
+
+        /// self + value / divisor.
+        pub fn add_quotient(self, _ value: Fr, _ divisor: Fr) -> Self {
+            Self {
+                numerator: self.numerator * divisor + value * self.denominator,
+                denominator: self.denominator * divisor,
+            }
+        }
+
+        pub fn scale(self, _ factor: Fr) -> Self {
+            Self { numerator: self.numerator * factor, denominator: self.denominator }
+        }
+
+        /// Cross-multiplied equality; exact because the denominator is nonzero.
+        pub fn equals(self, _ value: Fr) -> bool {
+            value * self.denominator == self.numerator
+        }
+
+        pub fn evaluate(self) -> Result<FieldArithmeticError, Fr>
+        uses (call: Call, ctx: Ctx)
+        {
+            self.numerator.divide(self.denominator)
+        }
+    }
+
+    /// Montgomery's trick: replace values[0..len] by their inverses with one
+    /// MODEXP and 3(len - 1) multiplications. A zero value reverts with the same
+    /// InvertOfZero error as inverting it alone.
+    pub(ingot) fn batch_invert<const N: usize>(_ values: mut [Fr; N], _ len: usize)
+    uses (call: Call, ctx: Ctx)
+    {
+        var scratch = ingot::arrays::Buffer<[Fr; N]>::new()
+        let prefix = mut scratch.get()
+        var product = Fr::one()
+        for i in 0 .. len {
+            prefix[i] = product
+            product = product * values[i]
+        }
+        var remaining = inverse(product)
+        var i = len
+        while i > 0 {
+            i -= 1
+            let value = values[i]
+            values[i] = remaining * prefix[i]
+            remaining = remaining * value
+        }
+    }
+}
+
+pub mod libra {
+    // SPDX-License-Identifier: Apache-2.0
+    // Pinned BaseZKHonkVerifier.checkEvalsConsistency (small subgroup IPA).
+    use ingot::field::{Fr, Fraction, inverse, scalar_constant}
+    use ingot::verification_key::MAX_LOG_N
+    use std::evm::{Call, Ctx, revert_error}
+
+    #[inline(never)]
+    pub fn check_consistency(
+        _ evaluations: [Fr; 4],
+        _ r: Fr,
+        _ challenges: ref [Fr; MAX_LOG_N],
+        _ log_n: usize,
+        _ libra_evaluation: Fr,
+    ) -> bool
+    uses (call: Call, ctx: Ctx)
+    {
+        // r^256 by eight squarings: the same value as the reference pow(256).
+        var power = r
+        for _ in 0 .. 8 {
+            power = power * power
+        }
+        let vanishing = power - Fr::one()
+        if vanishing == Fr::zero() {
+            revert_error(ingot::errors::GeminiChallengeInSubgroup {})
+        }
+        let generator = scalar_constant(
+            0x07b0c561a6148404f086204a9f36ffb0617942546750f230c893619174a57a76,
+        )
+        let generator_inverse = scalar_constant(
+            0x204bd3277422fad364751ad938e2b5e6a54cf8c68712848a692c553d0329f5d6,
+        )
+        // Only 1 + 9*log_n Lagrange coefficients are nonzero. The vanishing check
+        // guarantees every subgroup denominator is nonzero, so the interior sum is
+        // one fraction and a single inversion yields all three reciprocals.
+        let first_denominator = r - Fr::one()
+        let last_denominator = generator * r - Fr::one()
+        var interior = Fraction::from(Fr::zero())
+        var root_power = generator_inverse
+        for round in 0 .. log_n {
+            var coefficient = Fr::one()
+            for _ in 0 .. 9 {
+                interior = interior.add_quotient(coefficient, root_power * r - Fr::one())
+                coefficient = coefficient * challenges[round]
+                root_power = root_power * generator_inverse
+            }
+        }
+        let shared = inverse(
+            first_denominator * last_denominator * interior.denominator,
+        )
+        // (r^256 - 1) / 256, with 1/256 precomputed.
+        let numerator = vanishing *
+            scalar_constant(
+                0x3033ea246e506e898e97f570caffd704cb0bb460313fb720b29e139e5c100001,
+            )
+        let first = shared * last_denominator * interior.denominator * numerator
+        let last = shared * first_denominator * interior.denominator * numerator
+        let challenge_evaluation = first
+            + shared * first_denominator * last_denominator * interior.numerator * numerator
+        let difference = first * evaluations[2]
+            + (r - generator_inverse) *
+                (evaluations[1] - evaluations[2] - evaluations[0] * challenge_evaluation)
+            + last * (evaluations[2] - libra_evaluation) -
+            vanishing * evaluations[3]
+        difference == Fr::zero()
+    }
+}
+
+pub mod proof {
+    // Typed UltraHonk ZK payload. Round-indexed arrays have MAX_LOG_N capacity;
+    // only the first `log_n` entries are read from the proof or used.
+    use ingot::field::Fr
+    use ingot::types::EncodedG1
+    use ingot::verification_key::MAX_LOG_N
+
+    pub struct ParsedProof {
+        pub log_n: usize,
+        pub accumulator: [Fr; 8],
+        pub gemini_masking_poly: EncodedG1,
+        pub w1: EncodedG1,
+        pub w2: EncodedG1,
+        pub w3: EncodedG1,
+        pub w4: EncodedG1,
+        pub lookup_read_counts: EncodedG1,
+        pub lookup_read_tags: EncodedG1,
+        pub lookup_inverses: EncodedG1,
+        pub z_perm: EncodedG1,
+        pub libra_commitments: [EncodedG1; 3],
+        pub libra_sum: Fr,
+        pub sumcheck_univariates: [[Fr; 9]; MAX_LOG_N],
+        // Masking evaluation at index 0; WIRE entities start at index 1.
+        pub evaluations: [Fr; 42],
+        pub libra_evaluation: Fr,
+        pub gemini_fold_comms: [EncodedG1; MAX_LOG_N - 1],
+        pub gemini_a_evaluations: [Fr; MAX_LOG_N],
+        pub libra_poly_evals: [Fr; 4],
+        pub shplonk_q: EncodedG1,
+        pub kzg_quotient: EncodedG1,
+    }
+
+    pub struct RelationParameters {
+        pub eta: Fr,
+        pub rom_logup_gamma: Fr,
+        pub beta: Fr,
+        pub gamma: Fr,
+        pub public_inputs_delta: Fr,
+    }
+
+    impl Copy for RelationParameters {}
+
+    pub struct Transcript {
+        pub relation_parameters: RelationParameters,
+        pub alphas: [Fr; 30],
+        pub gate_challenges: [Fr; MAX_LOG_N],
+        pub libra_challenge: Fr,
+        pub sumcheck_challenges: [Fr; MAX_LOG_N],
+        pub rho: Fr,
+        pub gemini_r: Fr,
+        pub shplonk_nu: Fr,
+        pub shplonk_z: Fr,
+    }
+
+    /// The decoded proof, owned in memory and borrowed by every stage.
+    pub type ProofBuffer = ingot::arrays::Buffer<ParsedProof>
+}
+
+pub mod public_inputs {
+    use ingot::field::scalar_constant
+    use core::ptr::MemArray
+    use core::result::Result
+    use std::abi::{Bytes32, DynArray}
+    use ingot::errors::{PublicInputsLengthWrong, ValueGeFieldOrder}
+    use ingot::field::{FieldArithmeticError, Fr}
+    use std::evm::{Call, Ctx, revert_error}
+
+    /// Check the application inputs once at the ABI boundary: the key's count and
+    /// canonical scalars. The count is a runtime value, as in Solidity's
+    /// `bytes32[] calldata`, so it never changes the compiled verifier.
+    pub fn decode_inputs(_ raw: DynArray<Bytes32>, _ expected: usize) -> MemArray<Fr> {
+        if raw.len() != expected {
+            revert_error(PublicInputsLengthWrong {})
+        }
+        var inputs = MemArray<Fr>::new_zeroed(expected)
+        for i in 0 .. expected {
+            inputs[i] = match Fr::from_word(raw.get(i).val) {
+                Result::Ok(value) => value,
+                Result::Err(_) => revert_error(ValueGeFieldOrder {}),
+            }
+        }
+        inputs
+    }
+
+    /// Permutation correction for application inputs followed by eight accumulator
+    /// limbs. The pinned protocol places them after four disabled rows and one zero row.
+    pub fn public_input_delta(
+        _ inputs: ref MemArray<Fr>,
+        _ accumulator: [Fr; 8],
+        _ beta: Fr,
+        _ gamma: Fr,
+    ) -> Result<FieldArithmeticError, Fr>
+    uses (call: Call, ctx: Ctx)
+    {
+        var numerator = Fr::one()
+        var denominator = Fr::one()
+        var numerator_acc = gamma + beta * scalar_constant((1 << 28) + 5)
+        var denominator_acc = gamma - beta * scalar_constant(6)
+        for i in 0 .. inputs.len() + 8 {
+            let input = if i < inputs.len() {
+                inputs[i]
+            } else {
+                accumulator[i - inputs.len()]
+            }
+            numerator = numerator * (numerator_acc + input)
+            denominator = denominator * (denominator_acc + input)
+            numerator_acc = numerator_acc + beta
+            denominator_acc = denominator_acc - beta
+        }
+        numerator.divide(denominator)
+    }
+}
+
+pub mod relations {
+    // SPDX-License-Identifier: Apache-2.0
+    // Subrelation slots and batching match pinned Aztec Relations.sol.
+    use ingot::field::Fr
+    use ingot::proof::RelationParameters
+    use ingot::relations::{
+        arithmetic,
+        permutation,
+        lookup,
+        range,
+        elliptic,
+        memory,
+        rom,
+        nnf,
+        poseidon_external,
+        poseidon_internal,
+    }
+
+    /// Accumulate all 31 subrelations into `evaluations`, which must start zeroed.
+    pub fn evaluate(
+        _ values: [Fr; 41],
+        _ parameters: RelationParameters,
+        _ gate_weight: Fr,
+        _ evaluations: mut [Fr; 31],
+    ) {
+        arithmetic::accumulate(values, mut evaluations, gate_weight)
+        permutation::accumulate(values, parameters, mut evaluations, gate_weight)
+        lookup::accumulate(values, parameters, mut evaluations, gate_weight)
+        range::accumulate(values, mut evaluations, gate_weight)
+        elliptic::accumulate(values, mut evaluations, gate_weight)
+        memory::accumulate(values, parameters, mut evaluations, gate_weight)
+        rom::accumulate(values, parameters, mut evaluations, gate_weight)
+        nnf::accumulate(values, mut evaluations, gate_weight)
+        poseidon_external::accumulate(values, mut evaluations, gate_weight)
+        poseidon_internal::accumulate(values, mut evaluations, gate_weight)
+    }
+
+    pub fn batch(_ evaluations: [Fr; 31], _ alphas: [Fr; 30]) -> Fr {
+        var sum = evaluations[0]
+        for i in 1 .. 31 {
+            sum = sum + evaluations[i] * alphas[i - 1]
+        }
+        sum
+    }
+
+    use std::abi::{Bytes, sol}
+    use ingot::arrays::Buffer
+    use ingot::field::scalar_constant
+
+    /// Words in a RelationsLib call: 41 entities, 5 parameters, 30 alphas, gate weight.
+    pub const RELATION_INPUT_WORDS: usize = 77
+
+    /// One packed payload: fixed-size ABI arrays would decode word by word in code.
+    pub msg RelationCalls {
+        #[selector = sol("accumulateRelationEvaluations(bytes)")]
+        Accumulate { inputs: Bytes } -> u256,
+    }
+
+    /// Relation inputs and the 31 subrelation outputs, built in place.
+    struct RelationState { values: [Fr; 41], alphas: [Fr; 30], evaluations: [Fr; 31] }
+
+    /// The subrelations as their own contract, like Solidity's linked RelationsLib.
+    /// The verifier's constructor deploys it, so its code does not count toward the
+    /// verifier's EIP-170 budget. Callers pass canonical Fr words.
+    pub contract RelationsLib {
+        recv RelationCalls {
+            Accumulate { inputs } -> u256 {
+                assert!(inputs.len() == 32 * RELATION_INPUT_WORDS)
+                var buffer = Buffer<RelationState>::new()
+                let state = mut buffer.get()
+                for i in 0 .. 41 {
+                    state.values[i] = scalar_constant(inputs.word_at(32 * i))
+                }
+                for i in 0 .. 30 {
+                    state.alphas[i] = scalar_constant(inputs.word_at(32 * (46 + i)))
+                }
+                let rp = RelationParameters {
+                    eta: scalar_constant(inputs.word_at(32 * 41)),
+                    rom_logup_gamma: scalar_constant(inputs.word_at(32 * 42)),
+                    beta: scalar_constant(inputs.word_at(32 * 43)),
+                    gamma: scalar_constant(inputs.word_at(32 * 44)),
+                    public_inputs_delta: scalar_constant(inputs.word_at(32 * 45)),
+                }
+                let gate_weight = scalar_constant(inputs.word_at(32 * 76))
+                evaluate(state.values, rp, gate_weight, mut state.evaluations)
+                batch(state.evaluations, state.alphas).to_word()
+            }
+        }
+    }
+
+    pub mod arithmetic {
+        use ingot::field::scalar_constant
+        // SPDX-License-Identifier: Apache-2.0
+        // Port of Aztec Labs (2024) pinned Relations.sol: accumulateArithmeticRelation.
+        use ingot::field::Fr
+        use ingot::entities::{
+            Q_4,
+            Q_ARITH,
+            Q_C,
+            Q_L,
+            Q_M,
+            Q_O,
+            Q_R,
+            W_4,
+            W_4_SHIFT,
+            W_L,
+            W_L_SHIFT,
+            W_O,
+            W_R,
+        }
+
+        #[inline(never)]
+        pub fn accumulate(_ p: [Fr; 41], _ evals: mut [Fr; 31], _ domain_sep: Fr) {
+            let q_arith = p[Q_ARITH]
+            {
+                let neg_half = scalar_constant(
+                    0x183227397098d014dc2822db40c0ac2e9419f4243cdcb848a1f0fac9f8000000,
+                )
+                var accum = (q_arith - scalar_constant(3)) * (p[Q_M] * p[W_R] * p[W_L]) * neg_half
+                accum = accum
+                    + (p[Q_L] * p[W_L])
+                    + (p[Q_R] * p[W_R])
+                    + (p[Q_O] * p[W_O])
+                    + (p[Q_4] * p[W_4])
+                    + p[Q_C]
+                accum = accum + (q_arith - Fr::one()) * p[W_4_SHIFT]
+                accum = accum * q_arith
+                accum = accum * domain_sep
+                evals[6] = accum
+            }
+            {
+                var accum = p[W_L] + p[W_4] - p[W_L_SHIFT] + p[Q_M]
+                accum = accum * (q_arith - scalar_constant(2))
+                accum = accum * (q_arith - Fr::one())
+                accum = accum * q_arith
+                accum = accum * domain_sep
+                evals[7] = accum
+            }
+        }
+    }
+
+    pub mod elliptic {
+        use ingot::field::scalar_constant
+        // SPDX-License-Identifier: Apache-2.0
+        // Port of Aztec Labs (2024) pinned Relations.sol: accumulateEllipticRelation.
+        use ingot::field::Fr
+        use ingot::entities::{Q_ELLIPTIC, Q_L, Q_M, W_4_SHIFT, W_L_SHIFT, W_O, W_O_SHIFT, W_R, W_R_SHIFT}
+
+        #[inline(never)]
+        pub fn accumulate(_ p: [Fr; 41], _ evals: mut [Fr; 31], _ domain_sep: Fr) {
+            let x_1 = p[W_R]
+            let y_1 = p[W_O]
+            let x_2 = p[W_L_SHIFT]
+            let y_2 = p[W_4_SHIFT]
+            let y_3 = p[W_O_SHIFT]
+            let x_3 = p[W_R_SHIFT]
+            let q_sign = p[Q_L]
+            let q_is_double = p[Q_M]
+            let x_diff = (x_2 - x_1)
+            let y1_sqr = (y_1 * y_1)
+            {
+                let partialEval = domain_sep
+                let y2_sqr = (y_2 * y_2)
+                let y1y2 = y_1 * y_2 * q_sign
+                var x_add_identity = (x_3 + x_2 + x_1)
+                x_add_identity = x_add_identity * x_diff * x_diff
+                x_add_identity = x_add_identity - y2_sqr - y1_sqr + y1y2 + y1y2
+                evals[12] = x_add_identity * partialEval * p[Q_ELLIPTIC] * (Fr::one() - q_is_double)
+            }
+            {
+                let y1_plus_y3 = y_1 + y_3
+                let y_diff = y_2 * q_sign - y_1
+                let y_add_identity = y1_plus_y3 * x_diff + (x_3 - x_1) * y_diff
+                evals[13] = y_add_identity * domain_sep * p[Q_ELLIPTIC] * (Fr::one() - q_is_double)
+            }
+            {
+                let x_pow_4 = (y1_sqr + scalar_constant(17)) * x_1
+                var y1_sqr_mul_4 = y1_sqr + y1_sqr
+                y1_sqr_mul_4 = y1_sqr_mul_4 + y1_sqr_mul_4
+                let x1_pow_4_mul_9 = x_pow_4 * scalar_constant(9)
+                let x_double_identity = (x_3 + x_1 + x_1) * y1_sqr_mul_4 - x1_pow_4_mul_9
+                let acc = x_double_identity * domain_sep * p[Q_ELLIPTIC] * q_is_double
+                evals[12] = evals[12] + acc
+            }
+            {
+                let x1_sqr_mul_3 = (x_1 + x_1 + x_1) * x_1
+                let y_double_identity = x1_sqr_mul_3 * (x_1 - x_3) - (y_1 + y_1) * (y_1 + y_3)
+                evals[13] = evals[13] + y_double_identity * domain_sep * p[Q_ELLIPTIC] * q_is_double
+            }
+        }
+    }
+
+    pub mod lookup {
+        use ingot::field::scalar_constant
+        // SPDX-License-Identifier: Apache-2.0
+        // Port of Aztec Labs (2024) pinned Relations.sol: accumulateLogDerivativeLookupRelation.
+        use ingot::field::Fr
+        use ingot::entities::{
+            LOOKUP_INVERSES,
+            LOOKUP_READ_COUNTS,
+            LOOKUP_READ_TAGS,
+            Q_C,
+            Q_LOOKUP,
+            Q_M,
+            Q_O,
+            Q_R,
+            TABLE_1,
+            TABLE_2,
+            TABLE_3,
+            TABLE_4,
+            W_L,
+            W_L_SHIFT,
+            W_O,
+            W_O_SHIFT,
+            W_R,
+            W_R_SHIFT,
+        }
+        use ingot::proof::RelationParameters
+
+        #[inline(never)]
+        pub fn accumulate(
+            _ p: [Fr; 41],
+            _ rp: RelationParameters,
+            _ evals: mut [Fr; 31],
+            _ domain_sep: Fr,
+        ) {
+            var table_term = Fr::zero()
+            var lookup_term = Fr::zero()
+            {
+                var beta_sqr = rp.beta * rp.beta
+                table_term = p[TABLE_1]
+                    + rp.gamma
+                    + (p[TABLE_2] * rp.beta)
+                    + (p[TABLE_3] * beta_sqr)
+                    + (p[TABLE_4] * beta_sqr * rp.beta)
+            }
+            {
+                var beta_sqr = rp.beta * rp.beta
+                let derived_entry_1 = p[W_L] + rp.gamma + (p[Q_R] * p[W_L_SHIFT])
+                let derived_entry_2 = p[W_R] + p[Q_M] * p[W_R_SHIFT]
+                let derived_entry_3 = p[W_O] + p[Q_C] * p[W_O_SHIFT]
+                lookup_term = derived_entry_1
+                    + (derived_entry_2 * rp.beta)
+                    + (derived_entry_3 * beta_sqr)
+                    + (p[Q_O] * beta_sqr * rp.beta)
+            }
+            let lookup_inverse = p[LOOKUP_INVERSES] * table_term
+            let table_inverse = p[LOOKUP_INVERSES] * lookup_term
+            let inverse_exists_xor = p[LOOKUP_READ_TAGS] + p[Q_LOOKUP] - (p[LOOKUP_READ_TAGS] * p[Q_LOOKUP])
+            var accumulatorNone = lookup_term * table_term * p[LOOKUP_INVERSES] - inverse_exists_xor
+            accumulatorNone = accumulatorNone * domain_sep
+            let accumulatorOne = p[Q_LOOKUP] * lookup_inverse - p[LOOKUP_READ_COUNTS] * table_inverse
+            let read_tag = p[LOOKUP_READ_TAGS]
+            let read_tag_boolean_relation = read_tag * read_tag - read_tag
+            evals[3] = accumulatorNone
+            evals[4] = accumulatorOne
+            evals[5] = read_tag_boolean_relation * domain_sep
+        }
+    }
+
+    pub mod memory {
+        use ingot::field::scalar_constant
+        // SPDX-License-Identifier: Apache-2.0
+        // Port of Aztec Labs (2024) pinned Relations.sol: accumulateMemoryRelation.
+        use ingot::field::Fr
+        use ingot::entities::{
+            Q_4,
+            Q_C,
+            Q_L,
+            Q_M,
+            Q_MEMORY,
+            Q_O,
+            Q_R,
+            W_4,
+            W_4_SHIFT,
+            W_L,
+            W_L_SHIFT,
+            W_O,
+            W_O_SHIFT,
+            W_R,
+            W_R_SHIFT,
+        }
+        use ingot::proof::RelationParameters
+
+        #[inline(never)]
+        pub fn accumulate(
+            _ p: [Fr; 41],
+            _ rp: RelationParameters,
+            _ evals: mut [Fr; 31],
+            _ domain_sep: Fr,
+        ) {
+            let eta_two = rp.eta * rp.eta
+            let eta_three = eta_two * rp.eta
+            var memory_record_check = p[W_O] * eta_three
+            memory_record_check = memory_record_check + (p[W_R] * eta_two)
+            memory_record_check = memory_record_check + (p[W_L] * rp.eta)
+            memory_record_check = memory_record_check + p[Q_C]
+            let partial_record_check = memory_record_check
+            memory_record_check = memory_record_check - p[W_4]
+            let index_delta = p[W_L_SHIFT] - p[W_L]
+            let record_delta = p[W_4_SHIFT] - p[W_4]
+            let index_is_monotonically_increasing = index_delta * (index_delta - scalar_constant(1))
+            let adjacent_values_match_if_adjacent_indices_match = (index_delta * (-Fr::one()) + Fr::one()) *
+                record_delta
+            evals[15] = adjacent_values_match_if_adjacent_indices_match *
+                (p[Q_L] * p[Q_R]) *
+                (p[Q_MEMORY] * domain_sep)
+            evals[16] = index_is_monotonically_increasing * (p[Q_L] * p[Q_R]) * (p[Q_MEMORY] * domain_sep)
+            let ROM_consistency_check_identity = memory_record_check * (p[Q_L] * p[Q_R])
+            let access_type = (p[W_4] - partial_record_check)
+            let access_check = access_type * (access_type - scalar_constant(1))
+            var next_gate_access_type = p[W_O_SHIFT] * eta_three
+            next_gate_access_type = next_gate_access_type + (p[W_R_SHIFT] * eta_two)
+            next_gate_access_type = next_gate_access_type + (p[W_L_SHIFT] * rp.eta)
+            next_gate_access_type = p[W_4_SHIFT] - next_gate_access_type
+            let value_delta = p[W_O_SHIFT] - p[W_O]
+            let adjacent_values_match_if_adjacent_indices_match_and_next_access_is_a_read_operation = (index_delta *
+                        (-Fr::one())
+                    + Fr::one()) *
+                value_delta *
+                (next_gate_access_type * (-Fr::one()) + Fr::one())
+            let next_gate_access_type_is_boolean = next_gate_access_type * next_gate_access_type -
+                next_gate_access_type
+            evals[17] = adjacent_values_match_if_adjacent_indices_match_and_next_access_is_a_read_operation *
+                (p[Q_O]) *
+                (p[Q_MEMORY] * domain_sep)
+            evals[18] = index_is_monotonically_increasing * (p[Q_O]) * (p[Q_MEMORY] * domain_sep)
+            evals[19] = next_gate_access_type_is_boolean * (p[Q_O]) * (p[Q_MEMORY] * domain_sep)
+            let RAM_consistency_check_identity = access_check * (p[Q_O])
+            let timestamp_delta = p[W_R_SHIFT] - p[W_R]
+            let RAM_timestamp_check_identity = (index_delta * (-Fr::one()) + Fr::one()) * timestamp_delta -
+                p[W_O]
+            var memory_identity = ROM_consistency_check_identity
+            memory_identity = memory_identity + RAM_timestamp_check_identity * (p[Q_4] * p[Q_L])
+            memory_identity = memory_identity + memory_record_check * (p[Q_M] * p[Q_L])
+            memory_identity = memory_identity + RAM_consistency_check_identity
+            memory_identity = memory_identity * (p[Q_MEMORY] * domain_sep)
+            evals[14] = memory_identity
+        }
+    }
+
+    pub mod nnf {
+        use ingot::field::scalar_constant
+        // SPDX-License-Identifier: Apache-2.0
+        // Port of Aztec Labs (2024) pinned Relations.sol: accumulateNnfRelation.
+        use ingot::field::Fr
+        use ingot::entities::{
+            Q_4,
+            Q_M,
+            Q_NNF,
+            Q_O,
+            Q_R,
+            W_4,
+            W_4_SHIFT,
+            W_L,
+            W_L_SHIFT,
+            W_O,
+            W_O_SHIFT,
+            W_R,
+            W_R_SHIFT,
+        }
+
+        #[inline(never)]
+        pub fn accumulate(_ p: [Fr; 41], _ evals: mut [Fr; 31], _ domain_sep: Fr) {
+            var limb_subproduct = p[W_L] * p[W_R_SHIFT] + p[W_L_SHIFT] * p[W_R]
+            var non_native_field_gate_2 = (p[W_L] * p[W_4] + p[W_R] * p[W_O] - p[W_O_SHIFT])
+            non_native_field_gate_2 = non_native_field_gate_2 * scalar_constant(1 << 68)
+            non_native_field_gate_2 = non_native_field_gate_2 - p[W_4_SHIFT]
+            non_native_field_gate_2 = non_native_field_gate_2 + limb_subproduct
+            non_native_field_gate_2 = non_native_field_gate_2 * p[Q_4]
+            limb_subproduct = limb_subproduct * scalar_constant(1 << 68)
+            limb_subproduct = limb_subproduct + (p[W_L_SHIFT] * p[W_R_SHIFT])
+            var non_native_field_gate_1 = limb_subproduct
+            non_native_field_gate_1 = non_native_field_gate_1 - (p[W_O] + p[W_4])
+            non_native_field_gate_1 = non_native_field_gate_1 * p[Q_O]
+            var non_native_field_gate_3 = limb_subproduct
+            non_native_field_gate_3 = non_native_field_gate_3 + p[W_4]
+            non_native_field_gate_3 = non_native_field_gate_3 - (p[W_O_SHIFT] + p[W_4_SHIFT])
+            non_native_field_gate_3 = non_native_field_gate_3 * p[Q_M]
+            var non_native_field_identity = non_native_field_gate_1
+                + non_native_field_gate_2
+                + non_native_field_gate_3
+            non_native_field_identity = non_native_field_identity * p[Q_R]
+            var limb_accumulator_1 = p[W_R_SHIFT] * scalar_constant(1 << 14)
+            limb_accumulator_1 = limb_accumulator_1 + p[W_L_SHIFT]
+            limb_accumulator_1 = limb_accumulator_1 * scalar_constant(1 << 14)
+            limb_accumulator_1 = limb_accumulator_1 + p[W_O]
+            limb_accumulator_1 = limb_accumulator_1 * scalar_constant(1 << 14)
+            limb_accumulator_1 = limb_accumulator_1 + p[W_R]
+            limb_accumulator_1 = limb_accumulator_1 * scalar_constant(1 << 14)
+            limb_accumulator_1 = limb_accumulator_1 + p[W_L]
+            limb_accumulator_1 = limb_accumulator_1 - p[W_4]
+            limb_accumulator_1 = limb_accumulator_1 * p[Q_4]
+            var limb_accumulator_2 = p[W_O_SHIFT] * scalar_constant(1 << 14)
+            limb_accumulator_2 = limb_accumulator_2 + p[W_R_SHIFT]
+            limb_accumulator_2 = limb_accumulator_2 * scalar_constant(1 << 14)
+            limb_accumulator_2 = limb_accumulator_2 + p[W_L_SHIFT]
+            limb_accumulator_2 = limb_accumulator_2 * scalar_constant(1 << 14)
+            limb_accumulator_2 = limb_accumulator_2 + p[W_4]
+            limb_accumulator_2 = limb_accumulator_2 * scalar_constant(1 << 14)
+            limb_accumulator_2 = limb_accumulator_2 + p[W_O]
+            limb_accumulator_2 = limb_accumulator_2 - p[W_4_SHIFT]
+            limb_accumulator_2 = limb_accumulator_2 * p[Q_M]
+            var limb_accumulator_identity = limb_accumulator_1 + limb_accumulator_2
+            limb_accumulator_identity = limb_accumulator_identity * p[Q_O]
+            var nnf_identity = non_native_field_identity + limb_accumulator_identity
+            nnf_identity = nnf_identity * (p[Q_NNF] * domain_sep)
+            evals[22] = nnf_identity
+        }
+    }
+
+    pub mod permutation {
+        use ingot::field::scalar_constant
+        // SPDX-License-Identifier: Apache-2.0
+        // Port of Aztec Labs (2024) pinned Relations.sol: accumulatePermutationRelation.
+        use ingot::field::Fr
+        use ingot::entities::{
+            ID_1,
+            ID_2,
+            ID_3,
+            ID_4,
+            LAGRANGE_FIRST,
+            LAGRANGE_LAST,
+            SIGMA_1,
+            SIGMA_2,
+            SIGMA_3,
+            SIGMA_4,
+            W_4,
+            W_L,
+            W_O,
+            W_R,
+            Z_PERM,
+            Z_PERM_SHIFT,
+        }
+        use ingot::proof::RelationParameters
+
+        #[inline(never)]
+        pub fn accumulate(
+            _ p: [Fr; 41],
+            _ rp: RelationParameters,
+            _ evals: mut [Fr; 31],
+            _ domain_sep: Fr,
+        ) {
+            var grand_product_numerator = Fr::zero()
+            var grand_product_denominator = Fr::zero()
+            {
+                var num = p[W_L] + p[ID_1] * rp.beta + rp.gamma
+                num = num * (p[W_R] + p[ID_2] * rp.beta + rp.gamma)
+                num = num * (p[W_O] + p[ID_3] * rp.beta + rp.gamma)
+                num = num * (p[W_4] + p[ID_4] * rp.beta + rp.gamma)
+                grand_product_numerator = num
+            }
+            {
+                var den = p[W_L] + p[SIGMA_1] * rp.beta + rp.gamma
+                den = den * (p[W_R] + p[SIGMA_2] * rp.beta + rp.gamma)
+                den = den * (p[W_O] + p[SIGMA_3] * rp.beta + rp.gamma)
+                den = den * (p[W_4] + p[SIGMA_4] * rp.beta + rp.gamma)
+                grand_product_denominator = den
+            }
+            {
+                var acc = (p[Z_PERM] + p[LAGRANGE_FIRST]) * grand_product_numerator
+                acc = acc -
+                    ((p[Z_PERM_SHIFT] + (p[LAGRANGE_LAST] * rp.public_inputs_delta)) *
+                        grand_product_denominator)
+                acc = acc * domain_sep
+                evals[0] = acc
+            }
+            {
+                var acc = (p[LAGRANGE_LAST] * p[Z_PERM_SHIFT]) * domain_sep
+                evals[1] = acc
+            }
+            {
+                var acc = (p[LAGRANGE_FIRST] * p[Z_PERM]) * domain_sep
+                evals[2] = acc
+            }
+        }
+    }
+
+    pub mod poseidon_external {
+        use ingot::field::scalar_constant
+        // SPDX-License-Identifier: Apache-2.0
+        // Port of Aztec Labs (2024) pinned Relations.sol: accumulatePoseidonExternalRelation.
+        use ingot::field::Fr
+        use ingot::entities::{
+            Q_4,
+            Q_L,
+            Q_O,
+            Q_POSEIDON2_EXTERNAL,
+            Q_R,
+            W_4,
+            W_4_SHIFT,
+            W_L,
+            W_L_SHIFT,
+            W_O,
+            W_O_SHIFT,
+            W_R,
+            W_R_SHIFT,
+        }
+
+        #[inline(never)]
+        pub fn accumulate(_ p: [Fr; 41], _ evals: mut [Fr; 31], _ domain_sep: Fr) {
+            let s1 = p[W_L] + p[Q_L]
+            let s2 = p[W_R] + p[Q_R]
+            let s3 = p[W_O] + p[Q_O]
+            let s4 = p[W_4] + p[Q_4]
+            let u1 = s1 * s1 * s1 * s1 * s1
+            let u2 = s2 * s2 * s2 * s2 * s2
+            let u3 = s3 * s3 * s3 * s3 * s3
+            let u4 = s4 * s4 * s4 * s4 * s4
+            let t0 = u1 + u2
+            let t1 = u3 + u4
+            let t2 = u2 + u2 + t1
+            let t3 = u4 + u4 + t0
+            var v4 = t1 + t1
+            v4 = v4 + v4 + t3
+            var v2 = t0 + t0
+            v2 = v2 + v2 + t2
+            let v1 = t3 + v2
+            let v3 = t2 + v4
+            let q_pos_by_scaling = p[Q_POSEIDON2_EXTERNAL] * domain_sep
+            evals[23] = evals[23] + q_pos_by_scaling * (v1 - p[W_L_SHIFT])
+            evals[24] = evals[24] + q_pos_by_scaling * (v2 - p[W_R_SHIFT])
+            evals[25] = evals[25] + q_pos_by_scaling * (v3 - p[W_O_SHIFT])
+            evals[26] = evals[26] + q_pos_by_scaling * (v4 - p[W_4_SHIFT])
+        }
+    }
+
+    pub mod poseidon_internal {
+        use ingot::field::scalar_constant
+        // SPDX-License-Identifier: Apache-2.0
+        // Port of Aztec Labs (2024) pinned Relations.sol: accumulatePoseidonInternalRelation.
+        use ingot::field::Fr
+        use ingot::entities::{
+            Q_L,
+            Q_POSEIDON2_INTERNAL,
+            W_4,
+            W_4_SHIFT,
+            W_L,
+            W_L_SHIFT,
+            W_O,
+            W_O_SHIFT,
+            W_R,
+            W_R_SHIFT,
+        }
+
+        #[inline(never)]
+        pub fn accumulate(_ p: [Fr; 41], _ evals: mut [Fr; 31], _ domain_sep: Fr) {
+            let internal_matrix_diagonal = [
+                scalar_constant(
+                    0x10dc6e9c006ea38b04b1e03b4bd9490c0d03f98929ca1d7fb56821fd19d3b6e7,
+                ),
+                scalar_constant(
+                    0x0c28145b6a44df3e0149b3d0a30b3bb599df9756d4dd9b84a86b38cfb45a740b,
+                ),
+                scalar_constant(
+                    0x00544b8338791518b2c7645a50392798b21f75bb60e3596170067d00141cac15,
+                ),
+                scalar_constant(
+                    0x222c01175718386f2e2e82eb122789e352e105a3b8fa852613bc534433ee428b,
+                ),
+            ]
+            let s1 = p[W_L] + p[Q_L]
+            let u1 = s1 * s1 * s1 * s1 * s1
+            let u2 = p[W_R]
+            let u3 = p[W_O]
+            let u4 = p[W_4]
+            let u_sum = u1 + u2 + u3 + u4
+            let q_pos_by_scaling = p[Q_POSEIDON2_INTERNAL] * domain_sep
+            let v1 = u1 * internal_matrix_diagonal[0] + u_sum
+            evals[27] = evals[27] + q_pos_by_scaling * (v1 - p[W_L_SHIFT])
+            let v2 = u2 * internal_matrix_diagonal[1] + u_sum
+            evals[28] = evals[28] + q_pos_by_scaling * (v2 - p[W_R_SHIFT])
+            let v3 = u3 * internal_matrix_diagonal[2] + u_sum
+            evals[29] = evals[29] + q_pos_by_scaling * (v3 - p[W_O_SHIFT])
+            let v4 = u4 * internal_matrix_diagonal[3] + u_sum
+            evals[30] = evals[30] + q_pos_by_scaling * (v4 - p[W_4_SHIFT])
+        }
+    }
+
+    pub mod range {
+        use ingot::field::scalar_constant
+        // SPDX-License-Identifier: Apache-2.0
+        // Port of Aztec Labs (2024) pinned Relations.sol: accumulateDeltaRangeRelation.
+        use ingot::field::Fr
+        use ingot::entities::{Q_RANGE, W_4, W_L, W_L_SHIFT, W_O, W_R}
+
+        #[inline(never)]
+        pub fn accumulate(_ p: [Fr; 41], _ evals: mut [Fr; 31], _ domain_sep: Fr) {
+            let minus_one = Fr::zero() - Fr::one()
+            let minus_two = Fr::zero() - scalar_constant(2)
+            let minus_three = Fr::zero() - scalar_constant(3)
+            let delta_1 = p[W_R] - p[W_L]
+            let delta_2 = p[W_O] - p[W_R]
+            let delta_3 = p[W_4] - p[W_O]
+            let delta_4 = p[W_L_SHIFT] - p[W_4]
+            {
+                var acc = delta_1
+                acc = acc * (delta_1 + minus_one)
+                acc = acc * (delta_1 + minus_two)
+                acc = acc * (delta_1 + minus_three)
+                acc = acc * p[Q_RANGE]
+                acc = acc * domain_sep
+                evals[8] = acc
+            }
+            {
+                var acc = delta_2
+                acc = acc * (delta_2 + minus_one)
+                acc = acc * (delta_2 + minus_two)
+                acc = acc * (delta_2 + minus_three)
+                acc = acc * p[Q_RANGE]
+                acc = acc * domain_sep
+                evals[9] = acc
+            }
+            {
+                var acc = delta_3
+                acc = acc * (delta_3 + minus_one)
+                acc = acc * (delta_3 + minus_two)
+                acc = acc * (delta_3 + minus_three)
+                acc = acc * p[Q_RANGE]
+                acc = acc * domain_sep
+                evals[10] = acc
+            }
+            {
+                var acc = delta_4
+                acc = acc * (delta_4 + minus_one)
+                acc = acc * (delta_4 + minus_two)
+                acc = acc * (delta_4 + minus_three)
+                acc = acc * p[Q_RANGE]
+                acc = acc * domain_sep
+                evals[11] = acc
+            }
+        }
+    }
+
+    pub mod rom {
+        use ingot::field::scalar_constant
+        // SPDX-License-Identifier: Apache-2.0
+        // Port of Aztec Labs (2024) pinned Relations.sol: accumulateRomLogupRelation.
+        use ingot::field::Fr
+        use ingot::entities::{Q_4, Q_C, Q_L, Q_MEMORY, Q_R, W_4, W_L, W_O, W_R}
+        use ingot::proof::RelationParameters
+
+        #[inline(never)]
+        pub fn accumulate(
+            _ p: [Fr; 41],
+            _ rp: RelationParameters,
+            _ evals: mut [Fr; 31],
+            _ domain_sep: Fr,
+        ) {
+            let eta_two = rp.eta * rp.eta
+            let q_logup_table = p[Q_R] * (Fr::one() - p[Q_L])
+            let q_logup_read = p[Q_4] * (Fr::one() - p[Q_L])
+            let denom = rp.rom_logup_gamma + p[W_L] + (p[W_R] * rp.eta) + (p[Q_C] * eta_two)
+            evals[20] = (q_logup_table + q_logup_read) *
+                (p[W_4] * denom - Fr::one()) *
+                (p[Q_MEMORY] * domain_sep)
+            evals[21] = (q_logup_read - q_logup_table * p[W_O]) * p[W_4] * p[Q_MEMORY]
+        }
+    }
+}
+
+pub mod sumcheck {
+    use ingot::field::scalar_constant
+    use core::result::Result
+    use ingot::field::{FieldArithmeticError, Fr, Fraction}
+    use std::evm::{Call, Ctx}
+
+    /// Evaluate the degree-at-most-eight round polynomial at u with the
+    /// reference's barycentric formula, as one fraction: no inversion is needed.
+    /// Match the reference: u in 0..8 is an inversion-of-zero error.
+    pub fn interpolate_fraction(_ values: [Fr; 9], _ u: Fr) -> Result<FieldArithmeticError, Fraction> {
+        let denominators = [
+            scalar_constant(40320),
+            -scalar_constant(5040),
+            scalar_constant(1440),
+            -scalar_constant(720),
+            scalar_constant(576),
+            -scalar_constant(720),
+            scalar_constant(1440),
+            -scalar_constant(5040),
+            scalar_constant(40320),
+        ]
+        var numerator = Fr::one()
+        var sum = Fraction::from(Fr::zero())
+        for i in 0 .. 9 {
+            let difference = u - scalar_constant(i as u256)
+            numerator = numerator * difference
+            sum = sum.add_quotient(values[i], denominators[i] * difference)
+        }
+        // Zero exactly when some u - i is zero: the reference's failed inversion.
+        if sum.denominator == Fr::zero() {
+            return Result::Err(FieldArithmeticError::ZeroInverse)
+        }
+        Result::Ok(sum.scale(numerator))
+    }
+
+    pub fn interpolate(_ values: [Fr; 9], _ u: Fr) -> Result<FieldArithmeticError, Fr>
+    uses (call: Call, ctx: Ctx)
+    {
+        match interpolate_fraction(values, u) {
+            Result::Ok(value) => value.evaluate(),
+            Result::Err(error) => Result::Err(error),
+        }
+    }
+
+    use ingot::proof::{ParsedProof, Transcript}
+
+    pub enum SumcheckError {
+        RoundMismatch,
+        Arithmetic(FieldArithmeticError),
+    }
+
+    /// Verify each round's g(0)+g(1)=target and return the final target and gate
+    /// weight. Targets stay fractions with nonzero denominators, so every round is
+    /// checked by cross-multiplication instead of nine inversions.
+    pub fn check_rounds(_ p: ParsedProof, _ t: Transcript) -> Result<SumcheckError, (Fraction, Fr)> {
+        var target = Fraction::from(t.libra_challenge * p.libra_sum)
+        var gate_weight = Fr::one()
+        for i in 0 .. p.log_n {
+            let round = ref p.sumcheck_univariates[i]
+            if !target.equals(round[0] + round[1]) {
+                return Result::Err(SumcheckError::RoundMismatch)
+            }
+            target = match interpolate_fraction(round, t.sumcheck_challenges[i]) {
+                Result::Ok(value) => value,
+                Result::Err(error) => {
+                    return Result::Err(SumcheckError::Arithmetic(error))
+                },
+            }
+            gate_weight = gate_weight *
+                (Fr::one() + t.sumcheck_challenges[i] * (t.gate_challenges[i] - Fr::one()))
+        }
+        Result::Ok((target, gate_weight))
+    }
+
+    use std::evm::Address
+    use core::ptr::MemArray
+    use std::abi::Bytes
+    use ingot::relations::{RELATION_INPUT_WORDS, RelationCalls}
+
+    /// Complete sumcheck relation check. The batched relation sum comes from the
+    /// verifier's RelationsLib contract. Opening authentication is a later stage.
+    pub fn verify_sumcheck(_ p: ParsedProof, _ t: Transcript, _ relations: Address) -> bool
+    uses (call: Call)
+    {
+        let (target, gate_weight) = match check_rounds(p, t) {
+            Result::Ok(values) => values,
+            Result::Err(SumcheckError::Arithmetic(error)) => ingot::errors::arithmetic(error),
+            Result::Err(SumcheckError::RoundMismatch) => {
+                return false
+            },
+        }
+        // RelationsLib payload; relation inputs skip the masking evaluation at index 0.
+        var words = MemArray<u256>::new_zeroed(RELATION_INPUT_WORDS)
+        for i in 0 .. 41 {
+            words[i] = p.evaluations[i + 1].to_word()
+        }
+        let rp = t.relation_parameters
+        words[41] = rp.eta.to_word()
+        words[42] = rp.rom_logup_gamma.to_word()
+        words[43] = rp.beta.to_word()
+        words[44] = rp.gamma.to_word()
+        words[45] = rp.public_inputs_delta.to_word()
+        for i in 0 .. 30 {
+            words[46 + i] = t.alphas[i].to_word()
+        }
+        words[76] = gate_weight.to_word()
+        let relation_sum = scalar_constant(
+            relations
+                .static(
+                    RelationCalls::Accumulate { inputs: Bytes::from_payload(source: words.span()) },
+                ),
+        )
+        var disabled_rows = Fr::one()
+        for i in 2 .. p.log_n {
+            disabled_rows = disabled_rows * (Fr::one() - t.sumcheck_challenges[i])
+        }
+        target
+            .equals(
+                relation_sum * (Fr::one() - disabled_rows) + p.libra_evaluation * t.libra_challenge,
+            )
+    }
+}
+
+pub mod transcript {
+    use core::ptr::MemArray
+    use ingot::types::{Digest256, EncodedG1}
+    use std::evm::crypto::{keccak256, keccak_words}
+
+    /// Hash exactly COUNT big-endian words, without an ABI offset or length header.
+    /// Fe's intrinsic handles packing and hashing; retain the full digest here.
+    pub fn hash_words<const COUNT: usize>(_ words: [u256; COUNT]) -> Digest256 {
+        Digest256::from_word(keccak_words(words))
+    }
+
+    use ingot::field::Fr
+    use ingot::proof::{ParsedProof, RelationParameters, Transcript}
+    use ingot::verification_key::MAX_LOG_N
+
+    /// A transcript round whose length depends on the circuit. Words are appended
+    /// in protocol order into one runtime-sized allocation, then hashed exactly as
+    /// Solidity's `abi.encodePacked(bytes32[] memory)`.
+    struct Round { words: MemArray<u256>, len: usize }
+
+    impl Round {
+        fn new(_ len: usize, _ previous: u256) -> Self {
+            var words = MemArray<u256>::new_zeroed(len)
+            words[0] = previous
+            Self { words, len: 1 }
+        }
+
+        fn push(mut self, _ word: u256) {
+            self.words[self.len] = word
+            self.len += 1
+        }
+
+        fn push_point(mut self, _ point: EncodedG1) {
+            self.push(point.x.to_word())
+            self.push(point.y.to_word())
+        }
+
+        /// Every slot must be filled; a short round would hash trailing zeros.
+        fn challenge(self) -> Fr {
+            assert!(self.len == self.words.len())
+            Digest256::from_word(keccak256(self.words.span())).reduce_to_fr()
+        }
+    }
+
+    pub fn eta_challenges(_ p: ParsedProof, _ inputs: ref MemArray<Fr>, _ vk_hash: u256) -> (Fr, Fr) {
+        // vk hash, application inputs, 8 accumulator limbs, 4 commitments.
+        var round = Round::new(inputs.len() + 17, vk_hash)
+        for i in 0 .. inputs.len() {
+            round.push(inputs[i].to_word())
+        }
+        for limb in p.accumulator {
+            round.push(limb.to_word())
+        }
+        round.push_point(p.gemini_masking_poly)
+        round.push_point(p.w1)
+        round.push_point(p.w2)
+        round.push_point(p.w3)
+        let eta = round.challenge()
+        (eta, challenge([eta.to_word()]))
+    }
+
+    pub fn beta_gamma(_ previous: Fr, _ p: ParsedProof) -> (Fr, Fr) {
+        let beta = challenge(
+            [
+                previous.to_word(),
+                p.lookup_read_counts.x.to_word(),
+                p.lookup_read_counts.y.to_word(),
+                p.lookup_read_tags.x.to_word(),
+                p.lookup_read_tags.y.to_word(),
+                p.w4.x.to_word(),
+                p.w4.y.to_word(),
+            ],
+        )
+        (beta, challenge([beta.to_word()]))
+    }
+
+    pub fn alpha_challenges(_ previous: Fr, _ p: ParsedProof, _ powers: mut [Fr; 30]) {
+        let alpha = challenge(
+            [
+                previous.to_word(),
+                p.lookup_inverses.x.to_word(),
+                p.lookup_inverses.y.to_word(),
+                p.z_perm.x.to_word(),
+                p.z_perm.y.to_word(),
+            ],
+        )
+        powers[0] = alpha
+        for i in 1 .. 30 {
+            powers[i] = powers[i - 1] * alpha
+        }
+    }
+
+    pub fn gate_challenges(_ previous: Fr, _ log_n: usize, _ gates: mut [Fr; MAX_LOG_N]) {
+        gates[0] = challenge([previous.to_word()])
+        for i in 1 .. log_n {
+            gates[i] = gates[i - 1] * gates[i - 1]
+        }
+    }
+
+    pub fn libra_challenge(_ previous: Fr, _ p: ParsedProof) -> Fr {
+        challenge(
+            [
+                previous.to_word(),
+                p.libra_commitments[0].x.to_word(),
+                p.libra_commitments[0].y.to_word(),
+                p.libra_sum.to_word(),
+            ],
+        )
+    }
+
+    pub fn sumcheck_challenges(_ previous: Fr, _ p: ParsedProof, _ challenges: mut [Fr; MAX_LOG_N]) {
+        var state = previous
+        for i in 0 .. p.log_n {
+            var words = ingot::arrays::zero_array<u256, 10>()
+            words[0] = state.to_word()
+            for j in 0 .. 9 {
+                words[j + 1] = p.sumcheck_univariates[i][j].to_word()
+            }
+            state = challenge(words)
+            challenges[i] = state
+        }
+    }
+
+    pub fn opening_challenges(_ previous: Fr, _ p: ParsedProof) -> (Fr, Fr, Fr, Fr) {
+        var rho_words = ingot::arrays::zero_array<u256, 48>()
+        rho_words[0] = previous.to_word()
+        for i in 0 .. 42 {
+            rho_words[i + 1] = p.evaluations[i].to_word()
+        }
+        rho_words[43] = p.libra_evaluation.to_word()
+        rho_words[44] = p.libra_commitments[1].x.to_word()
+        rho_words[45] = p.libra_commitments[1].y.to_word()
+        rho_words[46] = p.libra_commitments[2].x.to_word()
+        rho_words[47] = p.libra_commitments[2].y.to_word()
+        let rho = challenge(rho_words)
+        var gemini = Round::new(2 * p.log_n - 1, rho.to_word())
+        for i in 0 .. p.log_n - 1 {
+            gemini.push_point(p.gemini_fold_comms[i])
+        }
+        let r = gemini.challenge()
+        var nu = Round::new(p.log_n + 5, r.to_word())
+        for i in 0 .. p.log_n {
+            nu.push(p.gemini_a_evaluations[i].to_word())
+        }
+        for evaluation in p.libra_poly_evals {
+            nu.push(evaluation.to_word())
+        }
+        let nu = nu.challenge()
+        let z = challenge(
+            [nu.to_word(), p.shplonk_q.x.to_word(), p.shplonk_q.y.to_word()],
+        )
+        (rho, r, nu, z)
+    }
+
+    /// Every Fiat-Shamir challenge in protocol order, written into `t` in place.
+    #[inline(never)]
+    pub fn generate_transcript(
+        _ p: ParsedProof,
+        _ inputs: ref MemArray<Fr>,
+        _ vk_hash: u256,
+        _ t: mut Transcript,
+    ) {
+        let (eta, rom_logup_gamma) = eta_challenges(p, inputs, vk_hash)
+        let (beta, gamma) = beta_gamma(rom_logup_gamma, p)
+        t.relation_parameters = RelationParameters {
+            eta,
+            rom_logup_gamma,
+            beta,
+            gamma,
+            public_inputs_delta: Fr::zero(),
+        }
+        alpha_challenges(gamma, p, mut t.alphas)
+        // The next state is alpha, not the final power of alpha.
+        gate_challenges(t.alphas[0], p.log_n, mut t.gate_challenges)
+        t.libra_challenge = libra_challenge(t.gate_challenges[0], p)
+        sumcheck_challenges(t.libra_challenge, p, mut t.sumcheck_challenges)
+        let (rho, gemini_r, shplonk_nu, shplonk_z) = opening_challenges(
+            t.sumcheck_challenges[p.log_n - 1],
+            p,
+        )
+        t.rho = rho
+        t.gemini_r = gemini_r
+        t.shplonk_nu = shplonk_nu
+        t.shplonk_z = shplonk_z
+    }
+
+    fn challenge<const COUNT: usize>(_ words: [u256; COUNT]) -> Fr {
+        hash_words(words).reduce_to_fr()
+    }
+}
+
+pub mod types {
+    use ingot::field::{Fq, Fr}
+
+    /// An unreduced 256-bit digest. Its original bytes matter to the transcript.
+    pub struct Digest256 { word: u256 }
+
+    impl Copy for Digest256 {}
+
+    impl Digest256 {
+        pub fn from_word(_ word: u256) -> Self {
+            Self { word }
+        }
+
+        pub fn to_word(self) -> u256 {
+            self.word
+        }
+
+        /// Explicit reduction, only at the protocol's challenge-derivation boundary.
+        pub fn reduce_to_fr(self) -> Fr {
+            Fr::from_hash_word(self.word)
+        }
+    }
+
+    /// Both coordinates are canonical, but this point is NOT yet curve-checked.
+    /// (0, 0) is the EVM identity encoding and must not be rejected globally.
+    pub struct EncodedG1 { pub x: Fq, pub y: Fq }
+
+    impl Copy for EncodedG1 {}
+
+    /// Extension-field encoding imag * i + real, where i² = -1.
+    /// EIP-197 serializes imag BEFORE real. No extension-field arithmetic yet.
+    pub struct Fq2 { pub imag: Fq, pub real: Fq }
+
+    impl Copy for Fq2 {}
+
+    /// Canonical components only. The pairing precompile checks curve and subgroup
+    /// membership; this encoding must not be treated as an already validated G2.
+    pub struct EncodedG2 { pub x: Fq2, pub y: Fq2 }
+
+    impl Copy for EncodedG2 {}
+
+    /// One term of the Shplemini multi-scalar multiplication.
+    /// Keeping each point beside its scalar prevents parallel-array misalignment.
+    pub struct MsmTerm { pub point: EncodedG1, pub scalar: Fr }
+
+    impl Copy for MsmTerm {}
+
+    impl EncodedG1 {
+        pub fn identity() -> Self {
+            let zero = ingot::field::coordinate_constant(0)
+            Self { x: zero, y: zero }
+        }
+
+        pub fn generator() -> Self {
+            Self { x: ingot::field::coordinate_constant(1), y: ingot::field::coordinate_constant(2) }
+        }
+    }
+}
+
+pub mod verification_key {
+    // Circuit-independent key layout. Values come from the generated `circuit`
+    // module and are stored as immutable contract data by the constructor, so
+    // they never specialize the compiled verifier (Solidity: `immutable $LOG_N`).
+    use ingot::types::EncodedG1
+
+    /// Largest supported circuit, matching Solidity's CONST_PROOF_SIZE_LOG_N.
+    /// Arrays indexed by sumcheck round use this fixed capacity; `log_n` bounds loops.
+    pub const MAX_LOG_N: usize = 25
+    /// Shplemini MSM: shplonk_q, 37 unshifted, log_n - 1 folds, 3 Libra, G1, KZG.
+    pub const MSM_CAPACITY: usize = 42 + MAX_LOG_N
+    /// Eight recursive-accumulator limbs follow the application inputs.
+    pub const PAIRING_POINTS_SIZE: usize = 8
+
+    /// Commitments follow HonkTypes.WIRE order; the masking polynomial is not a VK entry.
+    pub struct VerificationKey {
+        pub log_n: usize,
+        pub application_inputs: usize,
+        pub hash: u256,
+        pub commitments: [EncodedG1; 28],
+    }
+
+    impl Copy for VerificationKey {}
+
+    impl VerificationKey {
+        /// Constructor-time validation; the generator enforces the same bounds.
+        pub fn is_supported(self) -> bool {
+            self.log_n >= 2
+                && self.log_n <= MAX_LOG_N
+                && self.application_inputs + PAIRING_POINTS_SIZE < 1 << self.log_n
+        }
+
+        /// Shplemini terms in use; the rest of MSM_CAPACITY stays empty.
+        pub fn msm_size(self) -> usize {
+            42 + self.log_n
+        }
+    }
+}
+
+pub mod verifier {
+    use core::result::Result
+    use std::abi::{Bytes, Bytes32, DynArray}
+    use std::evm::{Address, Call, Ctx, revert_empty, revert_error}
+    use ingot::arrays::Buffer
+    use ingot::field::coordinate_constant
+    use ingot::curve::{CurveError, G1, PairingTerm, msm, pairing_check}
+    use ingot::types::{EncodedG2, Fq2, MsmTerm}
+    use ingot::encoding::decode_proof
+    use ingot::proof::Transcript
+    use ingot::verification_key::{MSM_CAPACITY, VerificationKey}
+    use ingot::transcript::generate_transcript
+    use ingot::public_inputs::{decode_inputs, public_input_delta}
+    use ingot::sumcheck::verify_sumcheck
+    use ingot::commitments::opening_terms
+    use ingot::libra::check_consistency
+    use ingot::accumulator::aggregate
+    use ingot::errors::{self, SumcheckFailed, ConsistencyCheckFailed, ShpleminiFailed}
+
+    /// Pinned UltraHonk ZK/Keccak flavor for the circuit described by `key`.
+    /// The key is runtime data, so this code is identical for every circuit.
+    /// All failures reject.
+    #[inline(never)]
+    pub fn verify(
+        _ key: VerificationKey,
+        _ relations: Address,
+        _ proof: own Bytes,
+        _ raw_inputs: DynArray<Bytes32>,
+    ) -> bool
+    uses (call: Call, ctx: Ctx)
+    {
+        let decoded = decode_proof(proof, key.log_n)
+        let p = ref decoded.get()
+        let inputs = decode_inputs(raw_inputs, key.application_inputs)
+        var transcript = Buffer<Transcript>::new()
+        let t = mut transcript.get()
+        generate_transcript(p, ref inputs, key.hash, mut t)
+        t.relation_parameters.public_inputs_delta = match public_input_delta(
+            ref inputs,
+            p.accumulator,
+            t.relation_parameters.beta,
+            t.relation_parameters.gamma,
+        ) {
+            Result::Ok(value) => value,
+            Result::Err(error) => errors::arithmetic(error),
+        }
+        if !verify_sumcheck(p, t, relations) {
+            revert_error(SumcheckFailed {})
+        }
+        var msm_terms = Buffer<[MsmTerm; MSM_CAPACITY]>::new()
+        let terms = mut msm_terms.get()
+        opening_terms(p, key, t, mut terms)
+        if !check_consistency(
+            p.libra_poly_evals,
+            t.gemini_r,
+            ref t.sumcheck_challenges,
+            p.log_n,
+            p.libra_evaluation,
+        ) {
+            revert_error(ConsistencyCheckFailed {})
+        }
+        let lhs = match msm(terms, key.msm_size()) {
+            Result::Ok(value) => value,
+            Result::Err(_) => revert_error(ShpleminiFailed {}),
+        }
+        let rhs = match G1::from_encoded(p.kzg_quotient) {
+            Result::Ok(value) => value.negate(),
+            Result::Err(_) => revert_error(ShpleminiFailed {}),
+        }
+        let (lhs, rhs) = match aggregate(lhs, rhs, p.accumulator) {
+            Result::Ok(value) => value,
+            Result::Err(_) => revert_empty(),
+        }
+        match final_pairing(lhs, rhs) {
+            Result::Ok(true) => true,
+            Result::Err(CurveError::InvalidPairingResult) => revert_empty(),
+            _ => revert_error(ShpleminiFailed {}),
+        }
+    }
+
+    /// Pinned setup points, never caller-selected. Order matches utils.sol pairing.
+    pub fn final_pairing(_ lhs: G1, _ rhs: G1) -> Result<CurveError, bool>
+    uses (call: Call, ctx: Ctx)
+    {
+        let generator = g2(
+            0x198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2,
+            0x1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed,
+            0x090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b,
+            0x12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa,
+        )
+        let setup = g2(
+            0x260e01b251f6f1c7e7ff4e580791dee8ea51d87a358e038b4efe30fac09383c1,
+            0x0118c4d5b837bcc2bc89b5b398b5974e9f5944073b32078b7e231fec938883b0,
+            0x04fc6369f7110fe3d25156c1bb9a72859cf2a04641f99ba4ee413c80da6a5fe4,
+            0x22febda3c0c0632a56475b4214e5615e11e6dd3f96e6cea2854a87d4dacc5e55,
+        )
+        pairing_check(
+            PairingTerm { g1: lhs, g2: generator },
+            PairingTerm { g1: rhs, g2: setup },
+        )
+    }
+
+    fn g2(_ x_imag: u256, _ x_real: u256, _ y_imag: u256, _ y_real: u256) -> EncodedG2 {
+        EncodedG2 {
+            x: Fq2 { imag: coordinate_constant(x_imag), real: coordinate_constant(x_real) },
+            y: Fq2 { imag: coordinate_constant(y_imag), real: coordinate_constant(y_real) },
+        }
+    }
+}

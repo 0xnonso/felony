@@ -1,0 +1,1091 @@
+use core::num::{Bounded, trailing_zeros}
+use std::abi::Bytes32
+use std::evm::{Address, Call, Ctx, Log, wei}
+use std::evm::crypto::keccak_words
+use std::evm::units::{days, hours, minutes, weeks}
+use ingot::constants::BN254_SCALAR_MODULUS
+use ingot::bracket::{
+    FINAL,
+    LEFT_SEMIFINAL,
+    RIGHT_SEMIFINAL,
+    THIRD_PLACE,
+    bracket_size,
+    draws,
+    round_of,
+    round_size,
+    rounds,
+    tie_seat,
+    valid_capacity,
+}
+use ingot::merkle::{bracket_context, build_root, verify_pair}
+use ingot::settlement::{
+    LOSS_TAX_DIVISOR,
+    UPDATE_DIVISOR,
+    base_value,
+    split_pool,
+    to_shares,
+    usable_quote,
+}
+use ingot::events::{
+    BracketMatchChanged,
+    EntryClaimed,
+    ModelUpdated,
+    RoundChanged,
+    TournamentChanged,
+}
+use ingot::interfaces::{Arena, DepositVault, IRandomOracle, TournamentMsg, WrappedNative}
+use ingot::types::{
+    BracketMatch,
+    Entry,
+    EntryStatus,
+    MatchOutcome,
+    Payout,
+    RoundStage,
+    Tournament,
+    TournamentPhase,
+    TournamentStore,
+}
+use ingot::vault::{asset_of, deposit_assets, token_balance, transfer_shares}
+
+const ARENA_FINISHED: u256 = 4
+const ORACLE_READY: u256 = 2
+const ORACLE_EXPIRED: u256 = 3
+const BRACKET_DOMAIN: u256 = 512
+const DRAW_DOMAIN: u256 = 516
+const SEED_DOMAIN: u256 = 517
+
+const MIN_ENTRY_SECONDS: u256 = minutes(1).as_seconds()
+const MAX_ENTRY_SECONDS: u256 = days(30).as_seconds()
+const MIN_WINDOW_SECONDS: u256 = hours(1).as_seconds()
+const MAX_WINDOW_SECONDS: u256 = weeks(1).as_seconds()
+const MIN_UPDATE_SECONDS: u256 = minutes(1).as_seconds()
+const MAX_UPDATE_SECONDS: u256 = days(1).as_seconds()
+const PREVIEW_GAS: u256 = 1000000
+
+fn key(_ id: u256, _ index: u256) -> u256 {
+    keccak_words([id, index])
+}
+
+fn player_key(_ id: u256, _ player: Address) -> u256 {
+    keccak_words([id, player.word()])
+}
+
+fn now() -> u256 uses (ctx: Ctx) {
+    ctx.timestamp().as_seconds()
+}
+
+fn assert_unlocked() uses (store: TournamentStore) {
+    assert!(!store.guard.is_locked())
+}
+
+fn credit(_ player: Address, _ amount: u256) uses (store: mut TournamentStore) {
+    store.credits.set(
+            key: player,
+            value: store.credits.get(key: player) + amount,
+        )
+}
+
+#[inline(never)]
+fn load(_ id: u256) -> Tournament uses (store: TournamentStore) {
+    store.tournaments.get(key: id)
+}
+
+#[inline(never)]
+fn load_match(_ id: u256, _ index: u256) -> BracketMatch
+uses (store: TournamentStore)
+{
+    store.matches.get(key: key(id, index))
+}
+
+#[inline(never)]
+fn entry_at(_ id: u256, _ stored_slot: u256) -> Entry
+uses (store: TournamentStore)
+{
+    store.entries.get(key: key(id, stored_slot - 1))
+}
+
+#[inline(never)]
+fn set_entry(_ id: u256, _ stored_slot: u256, _ entry: Entry)
+uses (store: mut TournamentStore)
+{
+    store.entries.set(key: key(id, stored_slot - 1), value: entry)
+}
+
+#[inline(never)]
+fn save(_ id: u256, _ t: Tournament)
+uses (store: mut TournamentStore, log: mut Log)
+{
+    store.tournaments.set(key: id, value: t)
+    log.emit(
+        TournamentChanged { id, phase: t.phase.code(), count: t.count },
+    )
+}
+
+fn announce_round(_ id: u256, _ t: Tournament) uses (log: mut Log) {
+    log.emit(
+        RoundChanged {
+            id,
+            round: t.round,
+            stage: t.stage.code(),
+            until: t.until,
+            request: t.request,
+        },
+    )
+}
+
+#[inline(never)]
+fn save_match(_ id: u256, _ index: u256, _ m: BracketMatch)
+uses (store: mut TournamentStore, log: mut Log)
+{
+    store.matches.set(key: key(id, index), value: m)
+    let v = m.view()
+    log.emit(
+        BracketMatchChanged { id, index, state: v[0], winner: v[1], loser: v[2], match_id: v[3] },
+    )
+}
+
+fn result_of(_ id: u256, _ index: u256) -> (u256, u256)
+uses (store: TournamentStore)
+{
+    match load_match(id, index) {
+        BracketMatch::Resolved { winner, loser } => (winner, loser),
+        _ => {
+            assert!(false)
+            (0, 0)
+        },
+    }
+}
+
+fn contestants(_ id: u256, _ index: u256) -> (u256, u256)
+uses (store: TournamentStore)
+{
+    if index == THIRD_PLACE {
+        let (_, left_loser) = result_of(id, LEFT_SEMIFINAL)
+        let (_, right_loser) = result_of(id, RIGHT_SEMIFINAL)
+        (left_loser, right_loser)
+    } else {
+        let (left_winner, _) = result_of(id, 2 * index)
+        let (right_winner, _) = result_of(id, 2 * index + 1)
+        (left_winner, right_winner)
+    }
+}
+
+fn is_eligible(_ id: u256, _ slot: u256) -> bool uses (store: TournamentStore) {
+    (store.eligible.get(key: key(id, slot / 256)) >> (slot % 256)) & 1 == 1
+}
+
+fn mark_forfeited(_ id: u256, _ t: mut Tournament, _ stored_slot: u256)
+uses (store: mut TournamentStore)
+{
+    var entry = entry_at(id, stored_slot)
+    assert!(!entry.status.is_forfeited())
+    entry.status = EntryStatus::Forfeited
+    set_entry(id, stored_slot, entry)
+    t.forfeits += 1
+    let slot = stored_slot - 1
+    let k = key(id, slot / 256)
+    store.eligible.set(
+            key: k,
+            value: store.eligible.get(key: k) & ~(1 << (slot % 256)),
+        )
+}
+
+fn enter_running(_ id: u256, _ t: mut Tournament)
+uses (ctx: Ctx, log: mut Log)
+{
+    t.phase = TournamentPhase::Running
+    t.round = 0
+    t.stage = RoundStage::Window
+    t.until = now()
+    t.request = 0
+    t.pending = 0
+    announce_round(id, t)
+}
+
+fn lock_roster(_ id: u256, _ t: mut Tournament)
+uses (store: mut TournamentStore, arena: Address, ctx: Ctx, call: mut Call, log: mut Log)
+{
+    t.capacity = bracket_size(t.count)
+
+    store.guard.lock()
+    let first: u256 = arena.call(
+            Arena::ReserveManagedMatches { tournament: id, count: t.capacity },
+        )
+    store.guard.unlock()
+    assert!(first != 0)
+    for i in 0 .. 4 {
+        let word = i as u256
+        let first = word * 256
+        let n = if t.count <= first {
+            0
+        } else if t.count - first >= 256 {
+            256
+        } else {
+            t.count - first
+        }
+        let bits = if n == 256 {
+            0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+        } else {
+            (1 << n) - 1
+        }
+        store.eligible.set(key: key(id, word), value: bits)
+    }
+    if t.principal > 0 {
+        t.phase = TournamentPhase::AwaitingFunding
+        t.fund_by = now() + t.fund_seconds
+    } else {
+        enter_running(id, mut t)
+    }
+}
+
+fn begin_round(_ id: u256, _ t: mut Tournament, _ round: u256)
+uses (log: mut Log)
+{
+    t.round = round
+    t.stage = RoundStage::Active
+    t.pending = round_size(t.capacity, round)
+    announce_round(id, t)
+}
+
+fn end_round(_ id: u256, _ t: mut Tournament) uses (ctx: Ctx, log: mut Log) {
+    let next = t.round + 1
+    if t.round == rounds(t.capacity) {
+        return
+    }
+    if next <= draws(t.capacity) {
+        t.stage = RoundStage::Window
+        t.until = now() + t.window_seconds
+        t.request = 0
+        announce_round(id, t)
+    } else {
+        begin_round(id, mut t, next)
+    }
+}
+
+fn finish_match(
+    _ id: u256,
+    _ t: mut Tournament,
+    _ index: u256,
+    _ winner: u256,
+    _ loser: u256,
+    _ taxed: bool,
+)
+uses (store: mut TournamentStore, ctx: Ctx, log: mut Log)
+{
+    save_match(id, index, BracketMatch::Resolved { winner, loser })
+    if winner != 0 {
+        var entry = entry_at(id, winner)
+        entry.reached = round_of(t.capacity, index) + 1
+        set_entry(id, winner, entry)
+    }
+    if taxed {
+        var entry = entry_at(id, loser)
+        entry.deducted += t.principal / LOSS_TAX_DIVISOR
+        set_entry(id, loser, entry)
+    }
+    t.pending -= 1
+    if t.pending == 0 {
+        end_round(id, mut t)
+    }
+}
+
+fn draw_word(_ id: u256, _ t: Tournament, _ round: u256) -> u256
+uses (store: TournamentStore)
+{
+    let d = draws(t.capacity)
+    store.words.get(key: key(id, if round < d { round } else { d }))
+}
+
+fn open_match(
+    _ id: u256,
+    _ t: mut Tournament,
+    _ index: u256,
+    _ seat0: u256,
+    _ seat1: u256,
+    _ arena: Address,
+)
+uses (store: mut TournamentStore, ctx: Ctx, call: mut Call, log: mut Log)
+{
+    if seat0 != 0 && seat1 != 0 {
+        let first = entry_at(id, seat0)
+        let second = entry_at(id, seat1)
+        let word = draw_word(id, t, round_of(t.capacity, index))
+        let seed = keccak_words(
+                [SEED_DOMAIN, ctx.chainid(), ctx.address().word(), id, index, word],
+            )
+            % BN254_SCALAR_MODULUS
+        store.guard.lock()
+        let match_id: u256 = arena
+            .call(
+                Arena::CreateManagedMatch {
+                    player0: first.player,
+                    player1: second.player,
+                    commitment0: first.commitment,
+                    commitment1: second.commitment,
+                    tournament: id,
+                    seed,
+                    turn_seconds: t.turn_seconds,
+                    index,
+                },
+            )
+        store.guard.unlock()
+        save_match(id, index, BracketMatch::InArena { match_id })
+    } else {
+        finish_match(
+            id,
+            mut t,
+            index,
+            if seat0 != 0 { seat0 } else { seat1 },
+            0,
+            false,
+        )
+    }
+}
+
+fn lowest_eligible(_ id: u256) -> u256 uses (store: TournamentStore) {
+    for i in 0 .. 4 {
+        let word = i as u256
+        let bits = store.eligible.get(key: key(id, word))
+        if bits != 0 {
+            return word * 256 + trailing_zeros(bits) + 1
+        }
+    }
+    0
+}
+
+fn receives_bonus(_ t: Tournament, _ reached: u256) -> bool {
+    !t.phase.is_aborted() || reached > t.round
+}
+
+fn entitlement(_ t: Tournament, _ p: Payout, _ stored_slot: u256, _ entry: Entry) -> u256 {
+    var amount = to_shares(
+            base_value(
+                principal: t.principal,
+                deducted: entry.deducted,
+                scale: p.scale,
+                entrants: t.count,
+            ),
+            t.shares,
+            p.value,
+        )
+        + if receives_bonus(t, entry.reached) {
+            p.bonus
+        } else {
+            0
+        }
+    for i in 0 .. 3 {
+        if t.places[i] == stored_slot {
+            amount += p.prizes[i]
+        }
+    }
+    if t.remainder_slot == stored_slot {
+        amount += p.remainder
+    }
+    amount
+}
+
+fn settle(_ id: u256, _ t: mut Tournament, _ vault: Address)
+uses (store: mut TournamentStore, ctx: Ctx, call: Call)
+{
+    t.remainder_slot = lowest_eligible(id)
+    if t.principal == 0 {
+        store
+            .payouts
+            .set(
+                key: id,
+                value: Payout {
+                    value: 0,
+                    scale: 0,
+                    prizes: [0; 3],
+                    bonus: 0,
+                    remainder: 0,
+                    fee: 0,
+                    unowned: 0,
+                },
+            )
+        return
+    }
+    let shares = t.shares
+    if t.phase.is_aborted() && t.round == 0 {
+        store
+            .payouts
+            .set(
+                key: id,
+                value: Payout {
+                    value: shares,
+                    scale: shares,
+                    prizes: [0; 3],
+                    bonus: 0,
+                    remainder: shares % t.count,
+                    fee: 0,
+                    unowned: 0,
+                },
+            )
+        store.owed_shares += shares
+        return
+    }
+
+    assert!(ctx.gas() >= PREVIEW_GAS * 65 / 63)
+    let outcome = call
+        .try_static(
+            addr: vault,
+            gas: PREVIEW_GAS,
+            message: DepositVault::PreviewRedeem { shares },
+        )
+    var quote: u256 = 0
+    if outcome.success() && outcome.returndata_len() == 32 {
+        quote = outcome.decode()
+    }
+    let total_principal = t.count * t.principal
+    var value = shares
+    var scale = shares
+    if usable_quote(quote, shares) {
+        value = quote
+        scale = if quote < total_principal {
+            quote
+        } else {
+            total_principal
+        }
+    }
+    var kept: u256 = 0
+    var kept_shares: u256 = 0
+    var recipients: u256 = 0
+    var first_recipient: u256 = 0
+    var slot: u256 = 1
+    while slot <= t.count {
+        if is_eligible(id, slot - 1) {
+            let entry_key = key(id, slot - 1)
+            let base = base_value(
+                principal: t.principal,
+                deducted: store.entries.get(key: entry_key).deducted,
+                scale,
+                entrants: t.count,
+            )
+            kept += base
+            kept_shares += to_shares(base, shares, value)
+            if receives_bonus(t, store.entries.get(key: entry_key).reached) {
+                recipients += 1
+                if first_recipient == 0 {
+                    first_recipient = slot
+                }
+            }
+        }
+        slot += 1
+    }
+    t.remainder_slot = first_recipient
+    let s = split_pool(value - kept, eligible: recipients, places: t.places)
+    var prizes: [u256; 3] = [0; 3]
+    var assigned = kept_shares
+    for i in 0 .. 3 {
+        prizes[i] = to_shares(s.prizes[i], shares, value)
+        assigned += prizes[i]
+    }
+    let bonus = to_shares(s.bonus, shares, value)
+    let fee = to_shares(s.fee, shares, value)
+    assigned += recipients * bonus + fee
+
+    let rest = shares - assigned
+    let remainder = if recipients > 0 { rest } else { 0 }
+    let unowned = if recipients > 0 { 0 } else { rest }
+    store
+        .payouts
+        .set(
+            key: id,
+            value: Payout { value, scale, prizes, bonus, remainder, fee, unowned },
+        )
+    store.owed_shares += shares - unowned
+}
+
+pub contract FelonyTournament {
+    arena: Address,
+    vault: Address,
+    weth: Address,
+    oracle: Address,
+    fee_collector: Address,
+    mut store: TournamentStore,
+
+    init(
+        arena_: Address,
+        vault_: Address,
+        weth_: Address,
+        oracle_: Address,
+        fee_collector_: Address,
+    )
+    uses (mut arena, mut vault, mut weth, mut oracle, mut fee_collector, ctx: Ctx, call: Call)
+    {
+        assert!(ctx.extcodesize(arena_) > 0)
+        assert!(ctx.extcodesize(weth_) > 0)
+
+        assert!(asset_of(vault_) == weth_)
+        assert!(
+            ctx.extcodesize(oracle_) > 0 && fee_collector_ != Address::zero(),
+        )
+        arena = arena_
+        vault = vault_
+        weth = weth_
+        oracle = oracle_
+        fee_collector = fee_collector_
+    }
+
+    recv TournamentMsg {
+        Create {
+            capacity,
+            principal,
+            entry_seconds,
+            fund_seconds,
+            window_seconds,
+            turn_seconds,
+        } -> u256
+        uses (mut store, ctx: Ctx, log: mut Log)
+        {
+            assert_unlocked()
+            assert!(valid_capacity(capacity))
+            // Funding and settlement use the total roster principal.
+            assert!(principal <= u256::max() / capacity)
+            assert!(
+                entry_seconds >= MIN_ENTRY_SECONDS && entry_seconds <= MAX_ENTRY_SECONDS,
+            )
+            assert!(
+                fund_seconds >= MIN_WINDOW_SECONDS && fund_seconds <= MAX_WINDOW_SECONDS,
+            )
+            assert!(
+                window_seconds >= MIN_UPDATE_SECONDS && window_seconds <= MAX_UPDATE_SECONDS,
+            )
+            assert!(
+                turn_seconds >= minutes(1).as_seconds() && turn_seconds <= days(1).as_seconds(),
+            )
+            store.next_id += 1
+            let id = store.next_id
+            save(
+                id,
+                Tournament {
+                    manager: ctx.caller(),
+                    max_capacity: capacity,
+                    fund_seconds,
+                    window_seconds,
+                    turn_seconds,
+                    phase: TournamentPhase::Open,
+                    capacity,
+                    count: 0,
+                    principal,
+                    entry_end: now() + entry_seconds,
+                    fund_by: 0,
+                    round: 0,
+                    stage: RoundStage::Window,
+                    until: 0,
+                    request: 0,
+                    pending: 0,
+                    shares: 0,
+                    forfeits: 0,
+                    places: [0; 3],
+                    remainder_slot: 0,
+                },
+            )
+            id
+        }
+
+        #[payable]
+        Join { id, commitment } uses (
+            mut store,
+            arena,
+            weth,
+            ctx: Ctx,
+            call: mut Call,
+            log: mut Log,
+        ) {
+            assert_unlocked()
+            var t = load(id)
+            assert!(
+                t.phase.is_open() && now() <= t.entry_end,
+                "Registration closed",
+            )
+            assert!(commitment > 0 && commitment < BN254_SCALAR_MODULUS)
+            let amount = t.principal
+            assert!(ctx.value().as_wei() == amount, "Wrong payment")
+            let player = ctx.caller()
+            let index = player_key(id, player)
+            assert!(store.slots.get(key: index) == 0)
+            t.count += 1
+            set_entry(
+                id,
+                t.count,
+                Entry {
+                    player,
+                    commitment,
+                    status: EntryStatus::Eligible,
+                    claimed: false,
+                    deducted: 0,
+                    reached: 1,
+                    updated: 0,
+                },
+            )
+            store.slots.set(key: index, value: t.count)
+            store.liabilities += amount
+            if t.count == t.max_capacity {
+                lock_roster(id, mut t)
+            }
+            save(id, t)
+            if amount > 0 {
+                let held = token_balance(weth, ctx.address())
+                store.guard.lock()
+                call.call(
+                    addr: weth,
+                    gas: ctx.gas(),
+                    value: wei(amount),
+                    message: WrappedNative::Deposit {},
+                )
+                store.guard.unlock()
+                assert!(token_balance(weth, ctx.address()) - held == amount)
+            }
+        }
+
+        Leave { id } uses (mut store, ctx: Ctx, log: mut Log) {
+            assert_unlocked()
+            var t = load(id)
+            assert!(t.phase.is_open())
+            let index = player_key(id, ctx.caller())
+            let stored_slot = store.slots.get(key: index)
+            assert!(stored_slot != 0)
+            if stored_slot != t.count {
+                let moved = entry_at(id, t.count)
+                set_entry(id, stored_slot, moved)
+                store.slots.set(key: player_key(id, moved.player), value: stored_slot)
+            }
+            store.slots.set(key: index, value: 0)
+            t.count -= 1
+            credit(ctx.caller(), t.principal)
+            save(id, t)
+        }
+
+        Cancel { id } uses (mut store, ctx: Ctx, log: mut Log) {
+            assert_unlocked()
+            var t = load(id)
+            if t.phase.is_open() {
+                assert!(ctx.caller() == t.manager && now() > t.entry_end)
+            } else {
+                assert!(t.phase.is_awaiting_funding() && now() > t.fund_by)
+            }
+            t.phase = TournamentPhase::Cancelled
+            save(id, t)
+        }
+
+        Start { id } uses (mut store, arena, ctx: Ctx, call: mut Call, log: mut Log) {
+            assert_unlocked()
+            var t = load(id)
+            assert!(
+                t.phase.is_open() && ctx.caller() == t.manager && now() > t.entry_end,
+            )
+            assert!(t.count >= 16)
+            lock_roster(id, mut t)
+            save(id, t)
+        }
+
+        Fund { id } uses (mut store, vault, weth, ctx: Ctx, call: mut Call, log: mut Log) {
+            assert_unlocked()
+            var t = load(id)
+            assert!(t.phase.is_awaiting_funding() && now() <= t.fund_by)
+            let amount = t.count * t.principal
+            store.guard.lock()
+            t.shares = deposit_assets(vault, weth, amount)
+            store.guard.unlock()
+            store.liabilities -= amount
+            enter_running(id, mut t)
+            save(id, t)
+        }
+
+        #[payable]
+        RequestDraw { id } uses (mut store, oracle, ctx: Ctx, call: mut Call, log: mut Log) {
+            assert_unlocked()
+            var t = load(id)
+            assert!(t.phase.is_running() && t.stage.is_window())
+            assert!(now() >= t.until && now() <= t.until + t.fund_seconds)
+            let fee: u256 = oracle.static(IRandomOracle::QuoteFee {})
+            assert!(ctx.value().as_wei() == fee, "Wrong payment")
+            let context = keccak_words(
+                [DRAW_DOMAIN, ctx.chainid(), ctx.address().word(), id, t.round + 1],
+            )
+            store.guard.lock()
+            t.request = call
+                .call(
+                    addr: oracle,
+                    gas: ctx.gas(),
+                    value: wei(fee),
+                    message: IRandomOracle::RequestRandomness { context: Bytes32 { val: context } },
+                )
+            store.guard.unlock()
+            t.stage = RoundStage::Drawing
+            announce_round(id, t)
+            save(id, t)
+        }
+
+        BeginRound { id } uses (mut store, oracle, ctx: Ctx, call: Call, log: mut Log) {
+            assert_unlocked()
+            var t = load(id)
+            assert!(t.phase.is_running() && t.stage.is_drawing())
+            assert!(
+                oracle.static(IRandomOracle::Status { request_id: t.request }) == ORACLE_READY,
+            )
+            let word: u256 = oracle.static(IRandomOracle::GetRandomness { request_id: t.request })
+            let round = t.round + 1
+            store.words.set(key: key(id, round), value: word)
+            if round == 1 {
+                let seed = keccak_words(
+                    [
+                        BRACKET_DOMAIN,
+                        ctx.chainid(),
+                        ctx.address().word(),
+                        id,
+                        t.count,
+                        t.capacity,
+                        word,
+                    ],
+                )
+                let context = bracket_context(
+                    ctx.chainid(),
+                    ctx.address().word(),
+                    id,
+                    seed,
+                    t.count,
+                    t.capacity,
+                )
+                store.roots.set(
+                        key: id,
+                        value: build_root(seed, t.count, t.capacity, context),
+                    )
+                store.words.set(key: key(id, 0), value: seed)
+            }
+            begin_round(id, mut t, round)
+            save(id, t)
+        }
+
+        Abort { id } uses (mut store, oracle, vault, ctx: Ctx, call: Call, log: mut Log) {
+            assert_unlocked()
+            var t = load(id)
+            assert!(t.phase.is_running())
+            if t.stage.is_drawing() {
+                assert!(
+                    oracle.static(IRandomOracle::Status { request_id: t.request })
+                        == ORACLE_EXPIRED,
+                )
+            } else {
+                assert!(t.stage.is_window() && now() > t.until + t.fund_seconds)
+            }
+            t.places = [0; 3]
+            t.phase = TournamentPhase::Aborted
+            settle(id, mut t, vault)
+            save(id, t)
+        }
+
+        OpenMatch { id, index, slot0, slot1, siblings }
+        uses (mut store, arena, ctx: Ctx, call: mut Call, log: mut Log)
+        {
+            assert_unlocked()
+            var t = load(id)
+            assert!(
+                t.phase.is_running() && t.round == 1 && t.stage.is_active(),
+            )
+            match load_match(id, index) {
+                BracketMatch::Pending => {},
+                _ => assert!(false),
+            }
+            let context = bracket_context(
+                ctx.chainid(),
+                ctx.address().word(),
+                id,
+                store.words.get(key: key(id, 0)),
+                t.count,
+                t.capacity,
+            )
+            assert!(
+                verify_pair(
+                    store.roots.get(key: id),
+                    context,
+                    t.capacity,
+                    index,
+                    slot0,
+                    slot1,
+                    siblings,
+                ),
+            )
+            open_match(id, mut t, index, slot0, slot1, arena)
+            save(id, t)
+        }
+
+        Advance { id, index } uses (mut store, arena, ctx: Ctx, call: mut Call, log: mut Log) {
+            assert_unlocked()
+            var t = load(id)
+            assert!(t.phase.is_running())
+            match load_match(id, index) {
+                BracketMatch::Pending => {
+                    assert!(index < t.capacity / 2 && t.stage.is_active())
+                    assert!(round_of(t.capacity, index) == t.round)
+                    let (seat0, seat1) = contestants(id, index)
+                    open_match(id, mut t, index, seat0, seat1, arena)
+                },
+                BracketMatch::InArena { match_id } => {
+                    let info: [u256; 18] = arena.static(Arena::MatchInfo { id: match_id })
+                    let managed: [u256; 4] = arena.static(Arena::ManagedInfo { id: match_id })
+                    assert!(
+                        managed[0] == ctx.address().word() && info[6] == ARENA_FINISHED,
+                    )
+                    let seat0 = store.slots.get(key: keccak_words([id, info[0]]))
+                    let seat1 = store.slots.get(key: keccak_words([id, info[1]]))
+                    assert!(seat0 != 0 && seat1 != 0 && seat0 != seat1)
+                    let outcome = MatchOutcome::from_code(info[14])
+                    let placement = match outcome {
+                        MatchOutcome::Seat0Won => Some((seat0, seat1)),
+                        MatchOutcome::Seat1Won => Some((seat1, seat0)),
+                        MatchOutcome::Draw => if tie_seat(info[9]) == 0 {
+                            Some((seat0, seat1))
+                        } else {
+                            Some((seat1, seat0))
+                        },
+                        MatchOutcome::BothDefaulted => None,
+                    }
+                    match placement {
+                        None => {
+                            mark_forfeited(id, mut t, seat0)
+                            mark_forfeited(id, mut t, seat1)
+                            finish_match(id, mut t, index, 0, 0, false)
+                        },
+                        Some((winner, loser)) => {
+                            if managed[1] != 0 {
+                                mark_forfeited(id, mut t, loser)
+                                finish_match(id, mut t, index, winner, 0, false)
+                            } else {
+                                let taxed = round_of(t.capacity, index) + 2 <= rounds(t.capacity)
+                                finish_match(id, mut t, index, winner, loser, taxed)
+                            }
+                        },
+                    }
+                },
+                BracketMatch::Resolved { .. } => assert!(false),
+            }
+            save(id, t)
+        }
+
+        UpdateModel { id, commitment } uses (mut store, ctx: Ctx, log: mut Log) {
+            assert_unlocked()
+            let t = load(id)
+            assert!(t.phase.is_running() && t.stage.is_window())
+            assert!(t.round >= 1 && now() < t.until)
+            assert!(commitment > 0 && commitment < BN254_SCALAR_MODULUS)
+            let stored_slot = store.slots.get(key: player_key(id, ctx.caller()))
+            assert!(stored_slot != 0)
+            var entry = entry_at(id, stored_slot)
+            let next = t.round + 1
+            assert!(
+                !entry.status.is_forfeited() && entry.reached == next && entry.updated != next,
+            )
+            entry.commitment = commitment
+            entry.updated = next
+            entry.deducted += t.principal / UPDATE_DIVISOR
+            set_entry(id, stored_slot, entry)
+            log.emit(
+                ModelUpdated { id, slot: stored_slot - 1, commitment, deducted: entry.deducted },
+            )
+        }
+
+        Finalize { id } uses (mut store, vault, ctx: Ctx, call: Call, log: mut Log) {
+            assert_unlocked()
+            var t = load(id)
+            assert!(
+                t.phase.is_running() && t.round == rounds(t.capacity) && t.pending == 0,
+            )
+            let (first, second) = result_of(id, FINAL)
+            let (third, _) = result_of(id, THIRD_PLACE)
+            t.places = [first, second, third]
+            settle(id, mut t, vault)
+            t.phase = TournamentPhase::Settled
+            save(id, t)
+        }
+
+        Claim { id } uses (mut store, vault, ctx: Ctx, call: mut Call, log: mut Log) {
+            assert_unlocked()
+            let t = load(id)
+            let stored_slot = store.slots.get(key: player_key(id, ctx.caller()))
+            assert!(stored_slot != 0)
+            var entry = entry_at(id, stored_slot)
+            assert!(!entry.claimed, "Already claimed")
+            entry.claimed = true
+            set_entry(id, stored_slot, entry)
+            if t.phase.is_cancelled() {
+                credit(entry.player, t.principal)
+            } else {
+                assert!(
+                    t.phase.is_paying_shares() && is_eligible(id, stored_slot - 1),
+                )
+                let amount = entitlement(t, store.payouts.get(key: id), stored_slot, entry)
+                if amount > 0 {
+                    store.owed_shares -= amount
+                    store.guard.lock()
+                    transfer_shares(vault, entry.player, amount)
+                    store.guard.unlock()
+                }
+            }
+            log.emit(EntryClaimed { id, slot: stored_slot - 1 })
+        }
+
+        ClaimFees { id } uses (mut store, vault, fee_collector, ctx: Ctx, call: mut Call) {
+            assert_unlocked()
+            let t = load(id)
+            assert!(
+                ctx.caller() == fee_collector && t.phase.is_paying_shares(),
+            )
+            assert!(!store.fee_claimed.get(key: id))
+            store.fee_claimed.set(key: id, value: true)
+            let amount = store.payouts.get(key: id).fee
+            if amount > 0 {
+                store.owed_shares -= amount
+                store.guard.lock()
+                transfer_shares(vault, fee_collector, amount)
+                store.guard.unlock()
+            }
+        }
+
+        Withdraw { to } uses (mut store, weth, ctx: Ctx, call: mut Call) {
+            assert_unlocked()
+            assert!(to != Address::zero())
+            let amount = store.credits.get(key: ctx.caller())
+            assert!(amount > 0, "No credit")
+            store.credits.set(key: ctx.caller(), value: 0)
+            store.liabilities -= amount
+            store.guard.lock()
+            let before = ctx.selfbalance().as_wei()
+            weth.call(WrappedNative::Withdraw { amount })
+            assert!(ctx.selfbalance().as_wei() - before == amount)
+            let sent = call.send_value(addr: to, gas: ctx.gas(), value: wei(amount))
+            store.guard.unlock()
+            assert!(sent.success(), "ETH transfer failed")
+        }
+
+        TournamentInfo { id } -> [u256; 18] uses (store) {
+            let t = load(id)
+            [
+                t.phase.code(),
+                t.capacity,
+                t.count,
+                t.principal,
+                t.entry_end,
+                t.fund_by,
+                t.round,
+                t.stage.code(),
+                t.until,
+                t.request,
+                t.pending,
+                t.shares,
+                t.forfeits,
+                t.places[0],
+                t.places[1],
+                t.places[2],
+                t.remainder_slot,
+                if t.capacity == 0 {
+                    0
+                } else {
+                    rounds(t.capacity)
+                },
+            ]
+        }
+
+        RoundInfo { id } -> [u256; 7] uses (store) {
+            let t = load(id)
+            [
+                t.round,
+                t.stage.code(),
+                t.until,
+                t.request,
+                t.pending,
+                rounds(t.capacity),
+                draws(t.capacity),
+            ]
+        }
+
+        EntryInfo { id, slot } -> [u256; 6] uses (store) {
+            let t = load(id)
+            if slot >= t.count {
+                [0; 6]
+            } else {
+                let entry = entry_at(id, slot + 1)
+                [
+                    entry.player.word(),
+                    entry.commitment,
+                    entry.status.code(),
+                    if entry.claimed { 1 } else { 0 },
+                    entry.deducted,
+                    entry.reached,
+                ]
+            }
+        }
+
+        EntitlementOf { id, slot } -> u256 uses (store) {
+            let t = load(id)
+            if slot >= t.count || !t.phase.is_paying_shares() || !is_eligible(id, slot) {
+                0
+            } else {
+                entitlement(
+                    t,
+                    store.payouts.get(key: id),
+                    slot + 1,
+                    entry_at(id, slot + 1),
+                )
+            }
+        }
+
+        PayoutInfo { id } -> [u256; 9] uses (store) {
+            let p = store.payouts.get(key: id)
+            [
+                p.value,
+                p.scale,
+                p.prizes[0],
+                p.prizes[1],
+                p.prizes[2],
+                p.bonus,
+                p.remainder,
+                p.fee,
+                p.unowned,
+            ]
+        }
+
+        SlotOf { id, player } -> u256 uses (store) {
+            store.slots.get(key: player_key(id, player))
+        }
+
+        BracketRoot { id } -> u256 uses (store) {
+            store.roots.get(key: id)
+        }
+
+        BracketMatchInfo { id, index } -> [u256; 4]
+        uses (store)
+        {
+            load_match(id, index).view()
+        }
+
+        DrawWord { id, draw } -> u256 uses (store) {
+            store.words.get(key: key(id, draw))
+        }
+
+        CreditOf { player } -> u256 uses (store) {
+            store.credits.get(key: player)
+        }
+
+        Accounting -> [u256; 2] uses (store) {
+            [store.liabilities, store.owed_shares]
+        }
+
+        Settings -> [u256; 5] uses (arena, vault, weth, oracle, fee_collector) {
+            [arena.word(), vault.word(), weth.word(), oracle.word(), fee_collector.word()]
+        }
+
+        TournamentConfig { id } -> [u256; 5] uses (store) {
+            let t = load(id)
+            [t.manager.word(), t.max_capacity, t.fund_seconds, t.window_seconds, t.turn_seconds]
+        }
+    }
+
+    recv {
+        #[payable]
+        _ uses (weth, ctx: Ctx) {
+            assert!(ctx.caller() == weth)
+        }
+    }
+}
