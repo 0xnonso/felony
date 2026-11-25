@@ -19,11 +19,26 @@ This runs 2,048 updates of 128 games against heuristics and saved policies on on
 | `run.json` | The base model hash, settings, update count and library versions. |
 | `training_log.jsonl` | One line of diagnostics per update. |
 
-Checkpoint saves use a temporary file and atomic replacement. If a save fails before `training.pt` is replaced, the previous checkpoint remains usable; if no checkpoint exists yet, rerun the original command. If it fails afterwards, use `--resume`: the checkpoint contains the model and metadata even when `model.json` or `run.json` is missing or stale. Resume before using the export after an interrupted save. A successful resume adds the requested updates and rewrites both files. Older checkpoints still require their original `run.json`.
+### Checkpoint recovery
 
-Use only one training process per output directory. A hard kill may leave unused hidden temporary files. The diagnostic log can repeat updates from an interrupted attempt; the checkpoint's update count is authoritative. This protects against interrupted writes, not hardware or filesystem failure.
+Checkpoint saves use a temporary file and atomic replacement:
 
-`model/runs/` is ignored by git. `check` reports the file SHA-256, not the Poseidon2 model digest. Computing commitments and generating proof fixtures separately require Barretenberg 6.0.0; use the sibling toolchain or set `BARRETENBERG_BIN`.
+- If a save fails **before** `training.pt` is replaced, the previous checkpoint remains usable; if no checkpoint exists yet, rerun the original command.
+- If it fails **afterwards**, use `--resume`: the checkpoint contains the model and metadata even when `model.json` or `run.json` is missing or stale.
+- Resume before using the export after an interrupted save. A successful resume adds the requested updates and rewrites both files.
+- Older checkpoints still require their original `run.json`.
+
+### Operating rules
+
+- Use only one training process per output directory. A hard kill may leave unused hidden temporary files.
+- The diagnostic log can repeat updates from an interrupted attempt; the checkpoint's update count is authoritative.
+- Atomic saves protect against interrupted writes, not hardware or filesystem failure.
+
+### Paths and hashes
+
+- `model/runs/` is ignored by git.
+- `check` reports the file SHA-256, not the Poseidon2 model digest.
+- Computing commitments and generating proof fixtures separately require Barretenberg 6.0.0; use the sibling toolchain or set `BARRETENBERG_BIN`.
 
 ## Commands
 
@@ -40,7 +55,11 @@ All commands print JSON. Run them with `PYTHONPATH=model .venv/bin/python -m fel
 
 ## Tournament scoring
 
-Use `train OUT --scoring tournament` and `evaluate MODEL --scoring tournament` for tournament play. Higher total score wins; a score tie goes to the highest captured prize. For all-burn games the simulator uses the coin's expected score of 0.5 instead of sampling another coin. Thus the evaluation's `draw` statistic in this mode counts unresolved all-burn games before the on-chain coin, not final tournament draws. Score margins stay unchanged, including a zero margin for tiebreak wins.
+Use `train OUT --scoring tournament` and `evaluate MODEL --scoring tournament` for tournament play:
+
+- Higher total score wins; a score tie goes to the highest captured prize.
+- For all-burn games the simulator uses the coin's expected score of 0.5 instead of sampling another coin. Thus the evaluation's `draw` statistic in this mode counts unresolved all-burn games before the on-chain coin, not final tournament draws.
+- Score margins stay unchanged, including a zero margin for tiebreak wins.
 
 The default remains `--scoring pvp`, where every score tie is worth 0.5 and stakes are refunded. The training setting is saved in the checkpoint; resume keeps it. To change objectives, start a new run with `--base` pointing at the old export. Older checkpoints default to PvP scoring. The shipped base model uses PvP rewards. Training for tournament scoring uses the same model format and circuit.
 
@@ -62,7 +81,11 @@ PYTHONPATH=model .venv/bin/python -m felony train model/runs/control --updates 2
 PYTHONPATH=model .venv/bin/python -m felony train model/runs/challenger --updates 2048 --seed 7 --target model/base/felony-base.json
 ```
 
-Each run adds 262,144 games. The challenger samples the frozen base with probability 50% for each opponent group; the other groups use the ordinary pool of five heuristics and saved self-play policies. The proportion is approximate, not exactly half of every batch. `--target-fraction` changes it; `--opponent path/to/model.json` adds a model to the general pool without replacing the heuristics. Neither opponent is trained alongside your actor.
+Each run adds 262,144 games.
+
+- The challenger samples the frozen base with probability 50% for each opponent group; the other groups use the ordinary pool of five heuristics and saved self-play policies.
+- The proportion is approximate, not exactly half of every batch. `--target-fraction` changes it; `--opponent path/to/model.json` adds a model to the general pool without replacing the heuristics.
+- Neither opponent is trained alongside your actor.
 
 The target is copied to `target.json`, and extra opponents are saved inside `training.pt`. Resume with `train OUT --resume --updates N`; do not resupply opponents or a base. Deleting the original opponent files will not change the resumed run. `run.json` records their hashes and the total game budget.
 
@@ -73,7 +96,9 @@ PYTHONPATH=model .venv/bin/python -m felony evaluate model/runs/control/model.js
 PYTHONPATH=model .venv/bin/python -m felony evaluate model/runs/challenger/model.json --opponent model/base/felony-base.json --groups 5000 --seed 2027
 ```
 
-A score counts a win as 1 and a draw as 0.5. Above 0.5 means beating that opponent on average; also compare the challenger with the control to see whether targeting helped more than ordinary training. Bootstrap intervals resample whole seat-swapped pairs, preserving the dependence between the two games. They describe match luck, not uncertainty across training runs. The library's `compare_paired` compares candidates using paired differences on matching schedules; do not subtract interval endpoints to claim a significant gain.
+- A score counts a win as 1 and a draw as 0.5. Above 0.5 means beating that opponent on average; also compare the challenger with the control to see whether targeting helped more than ordinary training.
+- Bootstrap intervals resample whole seat-swapped pairs, preserving the dependence between the two games. They describe match luck, not uncertainty across training runs.
+- The library's `compare_paired` compares candidates using paired differences on matching schedules; do not subtract interval endpoints to claim a significant gain.
 
 Repeat evaluation against unfamiliar models that neither run trained against, plus the default heuristic panel (omit `--opponent`). If you have no unfamiliar models yet, report only target and heuristic performance. Choose evaluation seeds before looking at results, keep the same seed and opponents for both candidates, and repeat training with several seeds before claiming a reliable improvement. Fresh seeds do not make a repeatedly inspected opponent panel held out. Targeting can win against the base while making other matchups worse.
 
@@ -111,18 +136,36 @@ The root `uv.lock` pins the training environment. CPU float64 is intentional: th
 5. PPO adjusts action probabilities using those advantages, with a clipped update objective and an entropy bonus. Actor and critic gradients are clipped separately. This uses approximate gradients through the quantization, so it is a training recipe, not a convergence guarantee.
 6. Saving writes both a resumable `training.pt` and an integer-only `model.json`. Inference uses the latter. Optimizers, the value network and floating-point latent parameters stay outside the commitment.
 
-The output uses exact clipped integer tickets in the forward pass. Its backward pass uses a normalized softplus distribution as a surrogate, including at an all-zero fallback, so zero-ticket actions have a way to recover. The surrogate is deliberately biased and can differ materially from the forward distribution. `Config.surrogate_beta` controls its temperature without changing the exported forward rule.
+### Forward pass and surrogate
 
-### Optional training controls and endgame targets
+The output uses exact clipped integer tickets in the forward pass. Its backward pass uses a normalized softplus distribution as a surrogate, including at an all-zero fallback, so zero-ticket actions have a way to recover.
+
+The surrogate is deliberately biased and can differ materially from the forward distribution. `Config.surrogate_beta` controls its temperature without changing the exported forward rule.
+
+### Optional training controls
 
 The Python `Config` API exposes controls beyond the starter CLI. `opponent_sampling="hard"` uses a moving average of training rollout results to favour difficult opponents while retaining a nonzero sampling floor. Evaluation results do not update these scores.
 
-`felony.endgame` solves positions with at most three cards remaining using exact rational arithmetic. It averages unknown future loot uniformly and returns both players' mixed strategies with minimax certificates. Multiple optimal strategies are combined deterministically by averaging optimal vertices. It does not solve the full nine-card game or compute a best response to a particular opponent.
+### Endgame solver
 
-The solver uses PvP terminal rewards: win 1, score tie 0.5, loss 0. Completed bid history does not affect that objective once the remaining cards, current loot and score difference are known. It does not implement the tournament's highest-captured-prize tiebreak and must not be treated as an exact tournament teacher.
+`felony.endgame` solves positions with at most three cards remaining using exact rational arithmetic:
 
-`teacher_targets(features, legal)` returns `covered`, `policy`, `value` and `residual` arrays; positions with more than three cards are uncovered. Supply only covered examples to `Trainer.set_teacher`, with a positive `Config.teacher_coefficient`. Training uses squared probability error (Brier loss), which stays finite at zero tickets and preserves mixed targets. Teacher data and training state are saved in the checkpoint; loading uses PyTorch's `weights_only=True` mode.
+- It averages unknown future loot uniformly and returns both players' mixed strategies with minimax certificates.
+- Multiple optimal strategies are combined deterministically by averaging optimal vertices.
+- It does not solve the full nine-card game or compute a best response to a particular opponent.
+- The solver uses PvP terminal rewards: win 1, score tie 0.5, loss 0. Completed bid history does not affect that objective once the remaining cards, current loot and score difference are known.
+- It does not implement the tournament's highest-captured-prize tiebreak and must not be treated as an exact tournament teacher.
+
+### Teacher targets
+
+`teacher_targets(features, legal)` returns `covered`, `policy`, `value` and `residual` arrays; positions with more than three cards are uncovered. Supply only covered examples to `Trainer.set_teacher`, with a positive `Config.teacher_coefficient`.
+
+Training uses squared probability error (Brier loss), which stays finite at zero tickets and preserves mixed targets. Teacher data and training state are saved in the checkpoint; loading uses PyTorch's `weights_only=True` mode.
+
+### Sampling during training
 
 Most simulated training/evaluation moves use uniform uint64 draws with the same integer modulo/CDF rule. They do not run Poseidon or generate proofs per move. Export validation uses the actual context-bound Poseidon sampler. This separates strategic experimentation from cryptographic protocol validation without replacing the deployed inference algorithm.
+
+### Determinism
 
 The trainer enables PyTorch deterministic algorithms, and actor construction uses a local generator so evaluation policies do not reset the trainer's random stream. Exact cross-platform reproducibility is not promised; keep the recorded dependency versions and inspect the parity checks.
